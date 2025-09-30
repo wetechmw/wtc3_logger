@@ -95,6 +95,14 @@ class ParameterRow(QtWidgets.QWidget):
         )
         layout.addWidget(self._info_label, 1)
 
+        self._value_label = QtWidgets.QLabel("–")
+        self._value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        self._value_label.setStyleSheet(
+            "QLabel {color: %s; font-weight: 600; background: %s; border-radius: 8px; padding: 4px 10px;}"
+            % (colors.PRIMARY_DARK, colors.BACKGROUND)
+        )
+        layout.addWidget(self._value_label)
+
         indicator = ColorIndicator(setting.color)
         indicator.setToolTip("Linienfarbe im Diagramm")
         layout.addWidget(indicator)
@@ -127,6 +135,9 @@ class ParameterRow(QtWidgets.QWidget):
                 "QLabel {color: %s; font-weight: 500;}" % colors.MUTED_TEXT
             )
 
+    def update_value(self, display_value: str) -> None:
+        self._value_label.setText(display_value)
+
 
 class ParameterSidebar(QtWidgets.QWidget):
     """Zusammenklappbare Sidebar zur Parameterauswahl."""
@@ -136,6 +147,7 @@ class ParameterSidebar(QtWidgets.QWidget):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self._rows: Dict[str, ParameterRow] = {}
+        self._values: Dict[str, str] = {}
 
         self.setAutoFillBackground(True)
         palette = self.palette()
@@ -215,6 +227,7 @@ class ParameterSidebar(QtWidgets.QWidget):
                 row.changed.connect(self._on_row_changed)
                 self._scroll_layout.addWidget(row)
                 self._rows[setting.key] = row
+                self._apply_value_to_row(setting.key)
 
     def setting(self, key: str) -> ParameterSetting | None:
         row = self._rows.get(key)
@@ -235,6 +248,38 @@ class ParameterSidebar(QtWidgets.QWidget):
             collapsed = max(48, self._toggle.sizeHint().width() + 16)
             self.setMinimumWidth(collapsed)
             self.setMaximumWidth(collapsed)
+
+    def update_value(self, key: str, value: Number | str | None, unit: str | None) -> None:
+        formatted = self._format_value(value, unit)
+        self._values[key] = formatted
+        row = self._rows.get(key)
+        if row:
+            row.update_value(formatted)
+
+    def clear_values(self) -> None:
+        self._values.clear()
+        for row in self._rows.values():
+            row.update_value("–")
+
+    def forget_value(self, key: str) -> None:
+        self._values.pop(key, None)
+
+    def _apply_value_to_row(self, key: str) -> None:
+        value = self._values.get(key, "–")
+        row = self._rows.get(key)
+        if row:
+            row.update_value(value)
+
+    def _format_value(self, value: Number | str | None, unit: str | None) -> str:
+        if value is None:
+            return "–"
+        if isinstance(value, float):
+            text = ("%.3f" % value).rstrip("0").rstrip(".")
+        else:
+            text = str(value)
+        if unit:
+            return f"{text} {unit}"
+        return text
 
 
 class UnitPlot(QtWidgets.QFrame):
@@ -549,6 +594,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_records: List[Dict[str, Number | str]] = []
         self._auto_initialized: set[str] = set()
         self._meta_keys: set[str] = set(META_PARAMETER_KEYS)
+        self._seen_generation = self.databus.generation()
 
         self._init_palette()
         self._init_ui()
@@ -747,6 +793,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._curves.pop(key, None)
                 self._curve_units.pop(key, None)
                 self._auto_initialized.discard(key)
+                self.sidebar.forget_value(key)
                 changed = True
         if changed:
             self.sidebar.populate(self._ordered_settings())
@@ -774,6 +821,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_plot_visibility()
 
     def refresh(self) -> None:
+        generation = self.databus.generation()
+        if generation != self._seen_generation:
+            self._seen_generation = generation
+            self._on_data_reset()
+
         records = self.databus.snapshot()
         if not records:
             self._last_records = []
@@ -787,9 +839,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.meta_panel.update_meta(meta, last_record.get("P05"), status_detail)
 
         self._auto_initialize_from_record(last_record)
+        self._update_active_parameter_values(last_record)
 
         x_data = self._extract_x(records)
         self._update_curves(x_data, records)
+
+    def _on_data_reset(self) -> None:
+        self._last_records = []
+        self._auto_initialized.clear()
+        for plot in self._unit_plots.values():
+            plot.plot.clear()
+        self._curves.clear()
+        self._curve_units.clear()
+        self.sidebar.clear_values()
+        self._update_plot_visibility()
+
+    def _update_active_parameter_values(self, record: Dict[str, Number | str]) -> None:
+        for key, setting in self._parameter_settings.items():
+            if not setting.allow_graph:
+                continue
+            value = record.get(key) if setting.visible else None
+            self.sidebar.update_value(key, value, setting.unit)
 
     def _extract_x(self, records: List[Dict[str, Number | str]]) -> List[float]:
         x_vals: List[float] = []

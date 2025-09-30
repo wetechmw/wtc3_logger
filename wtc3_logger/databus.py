@@ -21,6 +21,7 @@ class DataBus:
         self._listeners: List[Callable[[Dict[str, str], Dict[str, Number | str]], None]] = []
         self._lock = Lock()
         self._persist_path = persist_path
+        self._generation = 0
         if persist_path:
             persist_path.parent.mkdir(parents=True, exist_ok=True)
             if not persist_path.exists():
@@ -40,6 +41,11 @@ class DataBus:
         if self._persist_path:
             self._append_csv(record)
 
+    def reset(self) -> None:
+        with self._lock:
+            self._records.clear()
+            self._generation += 1
+
     def _append_csv(self, record: Dict[str, Number | str]) -> None:
         assert self._persist_path is not None
         with self._persist_path.open("a", newline="", encoding="utf-8") as fh:
@@ -57,6 +63,10 @@ class DataBus:
         with self._lock:
             return dict(self._meta)
 
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
     def subscribe(self, fn: Callable[[Dict[str, str], Dict[str, Number | str]], None]) -> None:
         self._listeners.append(fn)
 
@@ -66,4 +76,3 @@ class DataBus:
 
 
 __all__ = ["DataBus"]
-

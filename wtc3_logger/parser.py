@@ -84,9 +84,15 @@ class Parser:
         self.data_hdr: List[str] = []
         self.phase: str = "find_header"
         self.listeners: List[Callable[[Dict[str, str], Dict[str, Number | str]], None]] = []
+        self.header_listeners: List[Callable[[List[str]], None]] = []
 
     def on_record(self, fn: Callable[[Dict[str, str], Dict[str, Number | str]], None]) -> None:
         self.listeners.append(fn)
+
+    def on_data_header(self, fn: Callable[[List[str]], None]) -> None:
+        """Registriert einen Callback für neue Datensatz-Header."""
+
+        self.header_listeners.append(fn)
 
     def reset(self) -> None:
         self.meta_hdr = []
@@ -99,9 +105,10 @@ class Parser:
             self.feed_line(line)
 
     def feed_line(self, line: str) -> None:
-        if not line.strip():
+        clean = line.replace("\x02", "").replace("\x03", "")
+        if not clean.strip():
             return
-        tokens = split_ws(line)
+        tokens = split_ws(clean)
         if self.phase == "expect_meta_values":
             self._handle_values(tokens)
             return
@@ -118,10 +125,12 @@ class Parser:
         elif not self.data_hdr:
             self.data_hdr = tokens
             self.phase = "expect_data_values"
+            self._emit_data_header()
         else:
             # neuer Block → Reset Daten-Header
             self.data_hdr = tokens
             self.phase = "expect_data_values"
+            self._emit_data_header()
 
     def _handle_values(self, tokens: List[str]) -> None:
         if self.phase == "expect_meta_values":
@@ -139,6 +148,12 @@ class Parser:
                     record[key] = self._cast_default(raw)
             for cb in self.listeners:
                 cb(self.meta, record)
+
+    def _emit_data_header(self) -> None:
+        if not self.data_hdr:
+            return
+        for cb in list(self.header_listeners):
+            cb(list(self.data_hdr))
 
     @staticmethod
     def _is_number(token: str) -> bool:

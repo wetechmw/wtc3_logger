@@ -59,6 +59,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     parser = Parser()
     parser.on_record(databus.append)
+    parser.on_data_header(lambda _: databus.reset())
 
     threads: list[FileTail | SerialReader] = []
     if config.sample_file and config.sample_file.exists():
