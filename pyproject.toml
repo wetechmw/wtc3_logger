@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wtc3-logger"
+version = "0.1.0"
+description = "Visualizer for WTC3 serial telemetry"
+readme = "README.md"
+authors = [
+  { name = "WeTech" }
+]
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+  "pyserial>=3.5",
+  "PySide6>=6.5",
+  "pyqtgraph>=0.13",
+  "pydantic>=2.6",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-qt>=4.3"]
+
+[project.scripts]
+wtc3-logger = "wtc3_logger.app:main"
