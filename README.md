@@ -10,6 +10,7 @@ Whitespace-basierte Protokoll und stellt es in einem freundlichen UI dar.
 - Parser für Meta- und Datenblöcke nach Agent-Spezifikation
 - Wegklappbare Parameter-Sidebar zur Steuerung von Sichtbarkeit, Farbe sowie Listen- und Chart-Zuordnung
 - Automatisch ein- und ausblendende Live-Plots pro SI-Einheit mit WeTech-Styling
+- Live-Plot mehrerer Kennlinien inklusive Achsenwahl
 - Tabellenansicht mit Filter- und Exportfunktionen
 - Persistenz als CSV-Protokoll
 - Design angelehnt an [wetech.de](https://www.wetech.de)
