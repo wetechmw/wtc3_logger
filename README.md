@@ -46,4 +46,3 @@ Tests ausführen:
 ```bash
 pytest
 ```
-
