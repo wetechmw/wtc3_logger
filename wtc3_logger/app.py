@@ -83,7 +83,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     app = QtWidgets.QApplication(sys.argv)
     window = MainWindow(databus, config)
-    window.showFullScreen()
+    window.showMaximized()
     exit_code = app.exec()
 
     for thread in threads:

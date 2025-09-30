@@ -10,13 +10,14 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from ..config import AppConfig
 from ..databus import DataBus
 from ..parser import PARAMETERS, Number
-from ..status import decode_status, label_strategy
+from ..status import StatusDetail, decode_status, label_strategy
 from . import colors
 
 
 SERIES_DEFAULT: List[str] = []
 META_PARAMETER_KEYS = {
     "P04",
+    "P05",
     "P07",
     "P08",
     "P70",
@@ -46,36 +47,19 @@ class ParameterSetting:
     unit: str | None
     color: str
     visible: bool
-    show_in_graph: bool
-    show_in_table: bool
     allow_graph: bool = True
 
 
-class ColorButton(QtWidgets.QPushButton):
-    """Kleiner Button, der die Linienfarbe repräsentiert."""
-
-    color_changed = QtCore.Signal(str)
+class ColorIndicator(QtWidgets.QFrame):
+    """Passives Farbfeld, das die Linienfarbe zeigt."""
 
     def __init__(self, color: str, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self._color = QtGui.QColor(color)
-        self.setFixedSize(28, 28)
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self._apply_style()
-        self.clicked.connect(self._choose_color)
-
-    def _choose_color(self) -> None:
-        color = QtWidgets.QColorDialog.getColor(self._color, self, "Farbe wählen")
-        if color.isValid():
-            self._color = color
-            self._apply_style()
-            self.color_changed.emit(color.name())
-
-    def _apply_style(self) -> None:
-        border = colors.PRIMARY_DARK
+        self.setFixedSize(18, 18)
         self.setStyleSheet(
-            "QPushButton {border: 2px solid %s; border-radius: 6px; background-color: %s;}\n"
-            "QPushButton::hover {border-color: %s;}" % (border, self._color.name(), colors.PRIMARY)
+            "QFrame {border-radius: 9px; border: 2px solid %s; background-color: %s;}"
+            % (colors.PRIMARY_LIGHT, self._color.name())
         )
 
 
@@ -100,31 +84,20 @@ class ParameterRow(QtWidgets.QWidget):
 
         self._visible_box = QtWidgets.QCheckBox()
         self._visible_box.setChecked(setting.visible)
-        self._visible_box.setToolTip("Parameter aktivieren")
+        self._visible_box.setToolTip("Sichtbarkeit umschalten")
         self._visible_box.toggled.connect(self._emit_change)
         layout.addWidget(self._visible_box)
 
-        info_label = QtWidgets.QLabel(f"{setting.key} – {setting.label}")
-        info_label.setStyleSheet(
+        unit = f" [{setting.unit}]" if setting.unit else ""
+        self._info_label = QtWidgets.QLabel(f"{setting.key} – {setting.label}{unit}")
+        self._info_label.setStyleSheet(
             "QLabel {color: %s; font-weight: 500;}" % colors.TEXT
         )
-        layout.addWidget(info_label, 1)
+        layout.addWidget(self._info_label, 1)
 
-        self._color_button = ColorButton(setting.color)
-        self._color_button.setToolTip("Linienfarbe festlegen")
-        self._color_button.color_changed.connect(self._on_color_changed)
-        layout.addWidget(self._color_button)
-
-        self._graph_box = QtWidgets.QCheckBox("Graph")
-        self._graph_box.setChecked(setting.show_in_graph and setting.allow_graph)
-        self._graph_box.setEnabled(setting.allow_graph)
-        self._graph_box.toggled.connect(self._emit_change)
-        layout.addWidget(self._graph_box)
-
-        self._table_box = QtWidgets.QCheckBox("Liste")
-        self._table_box.setChecked(setting.show_in_table)
-        self._table_box.toggled.connect(self._emit_change)
-        layout.addWidget(self._table_box)
+        indicator = ColorIndicator(setting.color)
+        indicator.setToolTip("Linienfarbe im Diagramm")
+        layout.addWidget(indicator)
 
         wrapper = QtWidgets.QHBoxLayout(self)
         wrapper.setContentsMargins(0, 0, 0, 0)
@@ -135,28 +108,24 @@ class ParameterRow(QtWidgets.QWidget):
     def setting(self) -> ParameterSetting:
         return self._setting
 
-    def _on_color_changed(self, color: str) -> None:
-        self._setting = replace(self._setting, color=color)
-        self.changed.emit(self._setting)
-
     def _emit_change(self) -> None:
         visible = self._visible_box.isChecked()
-        show_graph = self._graph_box.isChecked() and self._graph_box.isEnabled()
-        show_table = self._table_box.isChecked() and visible
         self._setting = replace(
             self._setting,
             visible=visible,
-            show_in_graph=show_graph,
-            show_in_table=show_table,
         )
         self._update_enabled_state()
         self.changed.emit(self._setting)
 
     def _update_enabled_state(self) -> None:
-        visible = self._visible_box.isChecked()
-        self._graph_box.setEnabled(self._setting.allow_graph and visible)
-        self._color_button.setEnabled(self._setting.allow_graph and visible)
-        self._table_box.setEnabled(visible)
+        if self._visible_box.isChecked():
+            self._info_label.setStyleSheet(
+                "QLabel {color: %s; font-weight: 500;}" % colors.TEXT
+            )
+        else:
+            self._info_label.setStyleSheet(
+                "QLabel {color: %s; font-weight: 500;}" % colors.MUTED_TEXT
+            )
 
 
 class ParameterSidebar(QtWidgets.QWidget):
@@ -318,6 +287,15 @@ class UnitPlot(QtWidgets.QFrame):
 
 
 
+META_GROUP_DEFINITIONS: Dict[str, set[str]] = {
+    "Ladegerät": {"P04", "P05", "P07", "P08"},
+    "Batterie": {"P70", "P71", "P77", "P78", "P79", "P80", "P81"},
+    "Temperaturfenster": {"P73", "P74", "P75", "P76"},
+    "Grenzwerte": {"P72", "P90", "P91", "P92"},
+}
+META_GROUP_ORDER = ["Ladegerät", "Batterie", "Temperaturfenster", "Grenzwerte", "Weitere Angaben"]
+
+
 class MetaDetailPanel(QtWidgets.QFrame):
     """Zeigt die einmaligen Meta-Informationen als Textfelder an."""
 
@@ -351,12 +329,11 @@ class MetaDetailPanel(QtWidgets.QFrame):
         self._scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         self._scroll.setWidgetResizable(True)
 
-        inner = QtWidgets.QWidget()
-        self._form = QtWidgets.QFormLayout(inner)
-        self._form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
-        self._form.setHorizontalSpacing(14)
-        self._form.setVerticalSpacing(10)
-        self._scroll.setWidget(inner)
+        self._scroll_content = QtWidgets.QWidget()
+        self._groups_layout = QtWidgets.QVBoxLayout(self._scroll_content)
+        self._groups_layout.setContentsMargins(0, 0, 0, 0)
+        self._groups_layout.setSpacing(12)
+        self._scroll.setWidget(self._scroll_content)
 
         outer.addWidget(self._scroll, 1)
 
@@ -367,12 +344,17 @@ class MetaDetailPanel(QtWidgets.QFrame):
         )
         outer.addWidget(self._placeholder)
 
-        self._fields: Dict[str, tuple[QtWidgets.QLabel, QtWidgets.QLineEdit]] = {}
         self._placeholder.show()
         self._scroll.hide()
 
-    def update_meta(self, meta: Dict[str, str]) -> None:
-        if not meta:
+    def update_meta(
+        self,
+        meta: Dict[str, str],
+        status_value: Number | str | None,
+        status_detail: StatusDetail | None,
+    ) -> None:
+        has_content = bool(meta) or status_value is not None
+        if not has_content:
             self._placeholder.show()
             self._scroll.hide()
             return
@@ -380,40 +362,113 @@ class MetaDetailPanel(QtWidgets.QFrame):
         self._placeholder.hide()
         self._scroll.show()
 
-        for key in sorted(meta.keys()):
-            value = meta[key]
-            entry = self._fields.get(key)
-            if entry is None:
-                caption = self._build_caption(key)
-                field = QtWidgets.QLineEdit()
-                field.setReadOnly(True)
-                field.setText(str(value))
-                field.setStyleSheet(
-                    "QLineEdit {background: %s; border: 1px solid %s; border-radius: 6px; padding: 6px 8px;}"
-                    % (colors.BACKGROUND, colors.PRIMARY_LIGHT)
-                )
-                self._form.addRow(caption, field)
-                self._fields[key] = (caption, field)
-            else:
-                caption, field = entry
-                field.setText(str(value))
-                caption.show()
-                field.show()
+        while self._groups_layout.count():
+            item = self._groups_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
 
-        for key in set(self._fields.keys()) - set(meta.keys()):
-            caption, field = self._fields.pop(key)
-            caption.hide()
-            field.hide()
+        combined = dict(meta)
+        if status_value is not None:
+            combined["P05"] = str(status_value)
 
-    def _build_caption(self, key: str) -> QtWidgets.QLabel:
-        info = PARAMETERS.get(key)
-        description = info.description if info else ""
+        grouped: Dict[str, List[str]] = {}
+        for key in sorted(combined.keys()):
+            group = self._group_name_for_key(key)
+            grouped.setdefault(group, []).append(key)
+
+        for group in META_GROUP_ORDER:
+            keys = grouped.get(group)
+            if not keys:
+                continue
+            box = QtWidgets.QGroupBox(group)
+            box.setStyleSheet(
+                "QGroupBox {border: 1px solid %s; border-radius: 10px; margin-top: 12px; padding: 10px 12px;}"
+                "QGroupBox::title {subcontrol-origin: margin; left: 12px; padding: 0 4px; color: %s; font-weight: 600;}"
+                % (colors.PRIMARY_LIGHT, colors.PRIMARY_DARK)
+            )
+            form = QtWidgets.QFormLayout()
+            form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+            form.setHorizontalSpacing(14)
+            form.setVerticalSpacing(8)
+
+            for key in keys:
+                info = PARAMETERS.get(key)
+                caption = self._build_caption(key, info)
+                value = combined[key]
+                field = self._create_value_field(value, info)
+                form.addRow(caption, field)
+                if key == "P05":
+                    detail_widget = self._build_status_details(status_detail)
+                    form.addRow(self._status_caption(), detail_widget)
+
+            box.setLayout(form)
+            self._groups_layout.addWidget(box)
+
+        self._groups_layout.addStretch(1)
+
+    def _group_name_for_key(self, key: str) -> str:
+        for group, keys in META_GROUP_DEFINITIONS.items():
+            if key in keys:
+                return group
+        return "Weitere Angaben"
+
+    def _build_caption(self, key: str, info) -> QtWidgets.QLabel:
+        description = getattr(info, "description", "") if info else ""
         text = f"{key} – {description}" if description else key
         label = QtWidgets.QLabel(text)
         label.setStyleSheet(
             "QLabel {color: %s; font-weight: 500;}" % colors.TEXT
         )
         return label
+
+    def _create_value_field(self, value: str, info) -> QtWidgets.QLineEdit:
+        display_value = self._format_value(value, info)
+        field = QtWidgets.QLineEdit()
+        field.setReadOnly(True)
+        field.setText(display_value)
+        field.setStyleSheet(
+            "QLineEdit {background: %s; border: 1px solid %s; border-radius: 6px; padding: 6px 8px;}"
+            % (colors.BACKGROUND, colors.PRIMARY_LIGHT)
+        )
+        return field
+
+    def _format_value(self, value: str, info) -> str:
+        if not info:
+            return str(value)
+        casted = info.cast(str(value))
+        if isinstance(casted, (int, float)):
+            formatted = self._format_number(casted)
+        else:
+            formatted = str(casted)
+        if info.unit:
+            return f"{formatted} {info.unit}"
+        return formatted
+
+    def _format_number(self, number: Number) -> str:
+        if isinstance(number, int):
+            return str(number)
+        return ("%.3f" % number).rstrip("0").rstrip(".")
+
+    def _status_caption(self) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel("Statusdetails")
+        label.setStyleSheet(
+            "QLabel {color: %s; font-weight: 500;}" % colors.TEXT
+        )
+        return label
+
+    def _build_status_details(self, status_detail: StatusDetail | None) -> QtWidgets.QWidget:
+        text = "Keine Statusinformationen verfügbar."
+        if status_detail and status_detail.details:
+            text = "\n".join(status_detail.details)
+        widget = QtWidgets.QLabel(text)
+        widget.setWordWrap(True)
+        widget.setStyleSheet(
+            "QLabel {background: %s; border: 1px solid %s; border-radius: 6px; padding: 6px 8px; color: %s;}"
+            % ("white", colors.PRIMARY_LIGHT, colors.TEXT)
+        )
+        widget.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        return widget
 
 
 class StatusBadgeBar(QtWidgets.QWidget):
@@ -440,7 +495,7 @@ class StatusBadgeBar(QtWidgets.QWidget):
         self.setLayout(layout)
         self.hide()
 
-    def update_state(self, meta: Dict[str, str], record: Dict[str, Number | str] | None) -> None:
+    def update_state(self, meta: Dict[str, str], status_detail: StatusDetail | None) -> None:
         strategy_code = meta.get("P04")
         friendly = label_strategy(strategy_code, self._config.strategy_labels)
         if friendly:
@@ -458,8 +513,8 @@ class StatusBadgeBar(QtWidgets.QWidget):
         self._badges.clear()
 
         statuses: list[str] = []
-        if record and "P05" in record:
-            statuses = decode_status(record.get("P05"), self._config.status_bits)
+        if status_detail:
+            statuses = status_detail.badges
 
         for text in statuses:
             badge = QtWidgets.QLabel(text)
@@ -510,17 +565,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             info = PARAMETERS[key]
             allow_graph = bool(info.unit) and key != self._x_key
+            if not allow_graph:
+                continue
             visible = key in SERIES_DEFAULT
-            show_in_graph = visible and allow_graph
-            show_in_table = visible
             settings[key] = ParameterSetting(
                 key=key,
                 label=info.description,
                 unit=info.unit,
                 color=self._color_for_key(key),
                 visible=visible,
-                show_in_graph=show_in_graph,
-                show_in_table=show_in_table,
                 allow_graph=allow_graph,
             )
         return settings
@@ -617,7 +670,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for key in self._parameter_order
             if (setting := self._parameter_settings.get(key))
             and setting.visible
-            and setting.show_in_graph
+            and setting.allow_graph
             and setting.unit
         ]
 
@@ -669,15 +722,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_parameter_setting_changed(self, key: str, setting: ParameterSetting) -> None:
         self._parameter_settings[key] = setting
-        if not setting.visible or not setting.show_in_graph:
+        if not setting.visible or not setting.allow_graph:
             self._remove_curve(key)
         else:
             self._apply_curve_color(key)
         self._update_plot_visibility()
         state = "aktiv" if setting.visible else "inaktiv"
-        graph_flag = "ja" if setting.show_in_graph else "nein"
         self.status.showMessage(
-            f"{setting.key} {state} – Graph: {graph_flag}",
+            f"{setting.key} {state}",
             2500,
         )
         self.sidebar.populate(self._ordered_settings())
@@ -706,14 +758,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if key not in self._parameter_settings or key in self._auto_initialized:
                 continue
             setting = self._parameter_settings[key]
-            desired_visible = True
-            desired_graph = setting.allow_graph
-            desired_table = setting.show_in_table or True
+            if not setting.allow_graph:
+                self._auto_initialized.add(key)
+                continue
             updated = replace(
                 setting,
-                visible=desired_visible,
-                show_in_graph=desired_graph,
-                show_in_table=desired_table,
+                visible=True,
             )
             if updated != setting:
                 self._parameter_settings[key] = updated
@@ -731,10 +781,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_records = records
         meta = self.databus.meta()
         self._handle_meta_parameters(meta)
-        self.status_badges.update_state(meta, records[-1])
-        self.meta_panel.update_meta(meta)
+        last_record = records[-1]
+        status_detail = decode_status(last_record.get("P05"))
+        self.status_badges.update_state(meta, status_detail)
+        self.meta_panel.update_meta(meta, last_record.get("P05"), status_detail)
 
-        self._auto_initialize_from_record(records[-1])
+        self._auto_initialize_from_record(last_record)
 
         x_data = self._extract_x(records)
         self._update_curves(x_data, records)
