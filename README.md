@@ -12,6 +12,7 @@ Whitespace-basierte Protokoll und stellt es in einem freundlichen UI dar.
 - Automatisch ein- und ausblendende Live-Plots pro SI-Einheit mit WeTech-Styling
 - Tabellenansicht mit Filter- und Exportfunktionen
 - Persistenz als CSV-Protokoll
+- Export eines strukturierten Messprotokolls als PDF
 - Design angelehnt an [wetech.de](https://www.wetech.de)
 
 ## Status- und Strategiemapping

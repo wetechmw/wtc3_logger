@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Dict, Iterable, List
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
 
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -12,6 +14,7 @@ from ..databus import DataBus
 from ..parser import PARAMETERS, Number
 from ..status import StatusDetail, decode_status, label_strategy
 from . import colors
+from .pdf_report import ParameterStatistic, render_measurement_report
 
 
 SERIES_DEFAULT: List[str] = []
@@ -182,8 +185,7 @@ class ParameterSidebar(QtWidgets.QWidget):
         self._scroll_layout.addStretch(1)
         self._scroll.setWidget(self._scroll_content)
 
-        self.setMinimumWidth(260)
-        self.setMaximumWidth(360)
+        self._update_dynamic_width(force=True)
 
     def populate(self, settings: Iterable[ParameterSetting]) -> None:
         # Entferne Platzhalter-Stretch, damit neue Elemente korrekt eingefügt werden.
@@ -202,6 +204,8 @@ class ParameterSidebar(QtWidgets.QWidget):
         self._add_section("Weitere Parameter", inactive)
 
         self._scroll_layout.addStretch(1)
+
+        self._update_dynamic_width()
 
     def _add_section(self, title: str, entries: List[ParameterSetting]) -> None:
         if not entries:
@@ -242,12 +246,21 @@ class ParameterSidebar(QtWidgets.QWidget):
         )
         self._scroll.setVisible(expanded)
         if expanded:
-            self.setMinimumWidth(260)
-            self.setMaximumWidth(360)
+            self._update_dynamic_width(force=True)
         else:
             collapsed = max(48, self._toggle.sizeHint().width() + 16)
             self.setMinimumWidth(collapsed)
             self.setMaximumWidth(collapsed)
+
+    def _update_dynamic_width(self, force: bool = False) -> None:
+        self._scroll_content.adjustSize()
+        content_width = self._scroll_content.sizeHint().width()
+        scrollbar_width = self._scroll.verticalScrollBar().sizeHint().width()
+        width = content_width + scrollbar_width + 24
+        width = max(260, min(520, width))
+        if force or self._toggle.isChecked():
+            self.setMinimumWidth(width)
+            self.setMaximumWidth(width)
 
     def update_value(self, key: str, value: Number | str | None, unit: str | None) -> None:
         formatted = self._format_value(value, unit)
@@ -321,13 +334,24 @@ class UnitPlot(QtWidgets.QFrame):
         self._unit = unit
         self._title_label.setText(f"Messwerte in {unit}")
         self.plot.setLabel("left", f"Wert [{unit}]")
+        self.enable_auto_y()
         self.show()
 
     def clear_unit(self) -> None:
         self._unit = None
         self._title_label.setText("Messwerte")
         self.plot.clear()
+        self.enable_auto_y()
         self.hide()
+
+    def set_y_bounds(self, lower: float, upper: float) -> None:
+        item = self.plot.getPlotItem()
+        item.enableAutoRange(axis="y", enable=False)
+        item.setYRange(lower, upper, padding=0)
+
+    def enable_auto_y(self) -> None:
+        item = self.plot.getPlotItem()
+        item.enableAutoRange(axis="y", enable=True)
 
 
 
@@ -595,6 +619,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._auto_initialized: set[str] = set()
         self._meta_keys: set[str] = set(META_PARAMETER_KEYS)
         self._seen_generation = self.databus.generation()
+        self._temperature_limits: Tuple[float, float] | None = None
 
         self._init_palette()
         self._init_ui()
@@ -704,6 +729,10 @@ class MainWindow(QtWidgets.QMainWindow):
         export_action.triggered.connect(self._open_csv)
         toolbar.addAction(export_action)
 
+        pdf_action = QtGui.QAction("Messprotokoll PDF", self)
+        pdf_action.triggered.connect(self._export_pdf)
+        toolbar.addAction(pdf_action)
+
         self.status = self.statusBar()
         self.status.setStyleSheet("color: %s" % colors.MUTED_TEXT)
         self.status.showMessage("Bereit")
@@ -781,6 +810,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar.populate(self._ordered_settings())
 
     def _handle_meta_parameters(self, meta: Dict[str, str]) -> None:
+        self._update_temperature_limits(meta)
+
         new_meta = set(meta.keys()) - self._meta_keys
         if not new_meta:
             return
@@ -798,6 +829,29 @@ class MainWindow(QtWidgets.QMainWindow):
         if changed:
             self.sidebar.populate(self._ordered_settings())
             self._update_plot_visibility()
+
+    def _update_temperature_limits(self, meta: Dict[str, str]) -> None:
+        values: List[float] = []
+        for key in ("P73", "P74", "P75", "P76"):
+            raw = meta.get(key)
+            if raw is None:
+                continue
+            info = PARAMETERS.get(key)
+            if not info:
+                continue
+            if isinstance(raw, str):
+                casted = info.cast(raw)
+            else:
+                casted = info.cast(str(raw))
+            if isinstance(casted, (int, float)):
+                values.append(float(casted))
+        if not values:
+            return
+        lower = min(values)
+        upper = max(values)
+        if lower == upper:
+            upper = lower + 1.0
+        self._temperature_limits = (lower, upper)
 
     def _auto_initialize_from_record(self, record: Dict[str, Number | str]) -> None:
         changed = False
@@ -852,6 +906,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._curves.clear()
         self._curve_units.clear()
         self.sidebar.clear_values()
+        self._temperature_limits = None
         self._update_plot_visibility()
 
     def _update_active_parameter_values(self, record: Dict[str, Number | str]) -> None:
@@ -879,9 +934,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if key not in active_keys:
                 self._remove_curve(key)
 
+        unit_ranges: Dict[str, Tuple[float, float]] = {}
         for unit, keys in visible_units.items():
             plot_widget = self._unit_plots[unit]
             plot = plot_widget.plot
+            unit_min: float | None = None
+            unit_max: float | None = None
             for key in keys:
                 xs: List[float] = []
                 ys: List[float] = []
@@ -901,6 +959,34 @@ class MainWindow(QtWidgets.QMainWindow):
                     curve = self._curves[key]
                     curve.setPen(pen)
                 self._curves[key].setData(xs, ys)
+                if ys:
+                    current_min = min(ys)
+                    current_max = max(ys)
+                    unit_min = current_min if unit_min is None else min(unit_min, current_min)
+                    unit_max = current_max if unit_max is None else max(unit_max, current_max)
+            if unit_min is not None and unit_max is not None:
+                unit_ranges[unit] = (unit_min, unit_max)
+
+        for unit, keys in visible_units.items():
+            plot_widget = self._unit_plots[unit]
+            bounds = unit_ranges.get(unit)
+            if bounds is None:
+                plot_widget.enable_auto_y()
+                continue
+            min_val, max_val = bounds
+            if unit == "°C":
+                if self._temperature_limits:
+                    lower, upper = self._temperature_limits
+                    lower = min(lower, min_val)
+                    upper = max(upper, max_val)
+                else:
+                    lower, upper = min_val, max_val
+            else:
+                lower = 0.0
+                upper = max(max_val * 1.05, 0.1)
+            if upper <= lower:
+                upper = lower + 1.0
+            plot_widget.set_y_bounds(float(lower), float(upper))
 
         # Sichtbare Einheiten sind bereits in _ensure_visible_units gespeichert
 
@@ -926,6 +1012,105 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status.showMessage("Keine CSV-Datei vorhanden", 3000)
             return
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def _export_pdf(self) -> None:
+        if not self._last_records:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Kein Messprotokoll",
+                "Es wurden noch keine Messdaten empfangen.",
+            )
+            return
+
+        default_dir = self.config.persist_path.parent
+        default_dir.mkdir(parents=True, exist_ok=True)
+        suggested = default_dir / f"messprotokoll_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        selected, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Messprotokoll speichern",
+            str(suggested),
+            "PDF-Dateien (*.pdf)",
+        )
+        if not selected:
+            return
+
+        target = Path(selected)
+        if target.suffix.lower() != ".pdf":
+            target = target.with_suffix(".pdf")
+
+        last_record = self._last_records[-1]
+        meta = self.databus.meta()
+        status_value = last_record.get("P05")
+        status_detail = decode_status(status_value)
+        strategy_code = meta.get("P04")
+        strategy_label = label_strategy(strategy_code, self.config.strategy_labels)
+
+        x_data = self._extract_x(self._last_records)
+        start_x = x_data[0] if x_data else None
+        end_x = x_data[-1] if x_data else None
+        duration = 0.0
+        if start_x is not None and end_x is not None:
+            duration = max(0.0, end_x - start_x)
+
+        visible_stats: List[ParameterStatistic] = []
+        hidden_stats: List[ParameterStatistic] = []
+        for key in self._parameter_order:
+            setting = self._parameter_settings.get(key)
+            if not setting:
+                continue
+            values: List[float] = []
+            for record in self._last_records:
+                value = record.get(key)
+                if isinstance(value, (int, float)):
+                    values.append(float(value))
+            if not values:
+                continue
+            stat = ParameterStatistic(
+                key=key,
+                label=setting.label,
+                unit=setting.unit,
+                min_value=min(values),
+                max_value=max(values),
+                last_value=values[-1],
+                color=setting.color,
+                visible=setting.visible,
+            )
+            if setting.visible:
+                visible_stats.append(stat)
+            else:
+                hidden_stats.append(stat)
+
+        x_info = PARAMETERS.get(self._x_key)
+        x_caption = f"{self._x_key} – {x_info.description}" if x_info and x_info.description else self._x_key
+        x_unit = x_info.unit if x_info else None
+
+        try:
+            render_measurement_report(
+                target,
+                meta,
+                status_value,
+                status_detail,
+                strategy_code,
+                strategy_label,
+                visible_stats,
+                hidden_stats,
+                len(self._last_records),
+                duration,
+                x_caption,
+                x_unit,
+                start_x,
+                end_x,
+                datetime.now(),
+            )
+        except Exception as exc:  # pragma: no cover - Qt Fehler schwer reproduzierbar
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Export fehlgeschlagen",
+                f"Das Messprotokoll konnte nicht erstellt werden:\n{exc}",
+            )
+            return
+
+        self.status.showMessage(f"Messprotokoll gespeichert: {target}", 4000)
 
 
 __all__ = ["MainWindow"]
