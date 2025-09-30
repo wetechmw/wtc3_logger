@@ -1,6 +1,7 @@
 """Qt UI für den Telemetrie-Viewer im Wetech-Stil."""
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List
 
 import pyqtgraph as pg
@@ -15,6 +16,248 @@ from . import colors
 
 SERIES_DEFAULT = ["P40", "P45", "P50", "P52", "P60", "P61"]
 
+
+@dataclass(slots=True)
+class ParameterSetting:
+    """Konfiguration für einen Telemetrie-Parameter."""
+
+    key: str
+    label: str
+    unit: str | None
+    color: str
+    visible: bool
+    show_in_graph: bool
+    show_in_table: bool
+    allow_graph: bool = True
+
+
+class ColorButton(QtWidgets.QPushButton):
+    """Kleiner Button, der die Linienfarbe repräsentiert."""
+
+    color_changed = QtCore.Signal(str)
+
+    def __init__(self, color: str, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._color = QtGui.QColor(color)
+        self.setFixedSize(28, 28)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self._apply_style()
+        self.clicked.connect(self._choose_color)
+
+    def _choose_color(self) -> None:
+        color = QtWidgets.QColorDialog.getColor(self._color, self, "Farbe wählen")
+        if color.isValid():
+            self._color = color
+            self._apply_style()
+            self.color_changed.emit(color.name())
+
+    def _apply_style(self) -> None:
+        border = colors.PRIMARY_DARK
+        self.setStyleSheet(
+            "QPushButton {border: 2px solid %s; border-radius: 6px; background-color: %s;}\n"
+            "QPushButton::hover {border-color: %s;}" % (border, self._color.name(), colors.PRIMARY)
+        )
+
+
+class ParameterRow(QtWidgets.QWidget):
+    """Eine Zeile in der Sidebar zur Steuerung eines Parameters."""
+
+    changed = QtCore.Signal(ParameterSetting)
+
+    def __init__(self, setting: ParameterSetting, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._setting = setting
+
+        container = QtWidgets.QFrame()
+        container.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        container.setStyleSheet(
+            "QFrame {background: %s; border: 1px solid %s; border-radius: 8px;}"
+            % ("white", colors.PRIMARY_LIGHT)
+        )
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(8)
+
+        self._visible_box = QtWidgets.QCheckBox()
+        self._visible_box.setChecked(setting.visible)
+        self._visible_box.setToolTip("Parameter aktivieren")
+        self._visible_box.toggled.connect(self._emit_change)
+        layout.addWidget(self._visible_box)
+
+        info_label = QtWidgets.QLabel(f"{setting.key} – {setting.label}")
+        info_label.setStyleSheet(
+            "QLabel {color: %s; font-weight: 500;}" % colors.TEXT
+        )
+        layout.addWidget(info_label, 1)
+
+        self._color_button = ColorButton(setting.color)
+        self._color_button.setToolTip("Linienfarbe festlegen")
+        self._color_button.color_changed.connect(self._on_color_changed)
+        layout.addWidget(self._color_button)
+
+        self._graph_box = QtWidgets.QCheckBox("Graph")
+        self._graph_box.setChecked(setting.show_in_graph and setting.allow_graph)
+        self._graph_box.setEnabled(setting.allow_graph)
+        self._graph_box.toggled.connect(self._emit_change)
+        layout.addWidget(self._graph_box)
+
+        self._table_box = QtWidgets.QCheckBox("Liste")
+        self._table_box.setChecked(setting.show_in_table)
+        self._table_box.toggled.connect(self._emit_change)
+        layout.addWidget(self._table_box)
+
+        wrapper = QtWidgets.QHBoxLayout(self)
+        wrapper.setContentsMargins(0, 0, 0, 0)
+        wrapper.addWidget(container)
+
+        self._update_enabled_state()
+
+    def setting(self) -> ParameterSetting:
+        return self._setting
+
+    def _on_color_changed(self, color: str) -> None:
+        self._setting = replace(self._setting, color=color)
+        self.changed.emit(self._setting)
+
+    def _emit_change(self) -> None:
+        visible = self._visible_box.isChecked()
+        show_graph = self._graph_box.isChecked() and self._graph_box.isEnabled()
+        show_table = self._table_box.isChecked() and visible
+        self._setting = replace(
+            self._setting,
+            visible=visible,
+            show_in_graph=show_graph,
+            show_in_table=show_table,
+        )
+        self._update_enabled_state()
+        self.changed.emit(self._setting)
+
+    def _update_enabled_state(self) -> None:
+        visible = self._visible_box.isChecked()
+        self._graph_box.setEnabled(self._setting.allow_graph and visible)
+        self._color_button.setEnabled(self._setting.allow_graph and visible)
+        self._table_box.setEnabled(visible)
+
+
+class ParameterSidebar(QtWidgets.QWidget):
+    """Zusammenklappbare Sidebar zur Parameterauswahl."""
+
+    changed = QtCore.Signal(str, ParameterSetting)
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._rows: Dict[str, ParameterRow] = {}
+
+        self.setAutoFillBackground(True)
+        palette = self.palette()
+        palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor(colors.BACKGROUND))
+        self.setPalette(palette)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self._toggle = QtWidgets.QToolButton()
+        self._toggle.setText("Parameter")
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(True)
+        self._toggle.setArrowType(QtCore.Qt.ArrowType.DownArrow)
+        self._toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._toggle.setStyleSheet(
+            "QToolButton {color: %s; font-weight: 600; border: none;}" % colors.PRIMARY
+        )
+        self._toggle.toggled.connect(self._toggle_sidebar)
+        layout.addWidget(self._toggle)
+
+        self._scroll = QtWidgets.QScrollArea()
+        self._scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._scroll.setWidgetResizable(True)
+        layout.addWidget(self._scroll, 1)
+
+        self._scroll_content = QtWidgets.QWidget()
+        self._scroll_layout = QtWidgets.QVBoxLayout(self._scroll_content)
+        self._scroll_layout.setContentsMargins(0, 0, 0, 0)
+        self._scroll_layout.setSpacing(6)
+        self._scroll_layout.addStretch(1)
+        self._scroll.setWidget(self._scroll_content)
+
+        self.setMinimumWidth(260)
+        self.setMaximumWidth(360)
+
+    def populate(self, settings: Iterable[ParameterSetting]) -> None:
+        # Entferne Platzhalter-Stretch, damit neue Elemente korrekt eingefügt werden.
+        while self._scroll_layout.count():
+            item = self._scroll_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._rows.clear()
+
+        grouped: Dict[str, list[ParameterSetting]] = {}
+        for setting in settings:
+            grouped.setdefault(setting.unit or "Allgemein", []).append(setting)
+
+        for unit, entries in sorted(grouped.items(), key=lambda kv: kv[0]):
+            header = QtWidgets.QLabel(unit)
+            header.setStyleSheet(
+                "QLabel {color: %s; font-size: 14px; font-weight: 600;}" % colors.MUTED_TEXT
+            )
+            self._scroll_layout.addWidget(header)
+            for setting in sorted(entries, key=lambda s: s.label):
+                row = ParameterRow(setting)
+                row.changed.connect(self._on_row_changed)
+                self._scroll_layout.addWidget(row)
+                self._rows[setting.key] = row
+
+        self._scroll_layout.addStretch(1)
+
+    def setting(self, key: str) -> ParameterSetting | None:
+        row = self._rows.get(key)
+        return row.setting() if row else None
+
+    def _on_row_changed(self, setting: ParameterSetting) -> None:
+        self.changed.emit(setting.key, setting)
+
+    def _toggle_sidebar(self, expanded: bool) -> None:
+        self._toggle.setArrowType(
+            QtCore.Qt.ArrowType.DownArrow if expanded else QtCore.Qt.ArrowType.RightArrow
+        )
+        self._scroll.setVisible(expanded)
+        if expanded:
+            self.setMinimumWidth(260)
+            self.setMaximumWidth(360)
+        else:
+            collapsed = max(48, self._toggle.sizeHint().width() + 16)
+            self.setMinimumWidth(collapsed)
+            self.setMaximumWidth(collapsed)
+
+
+class UnitPlot(QtWidgets.QWidget):
+    """Wrapper um einen Plot je SI-Einheit."""
+
+    def __init__(self, unit: str, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        title = QtWidgets.QLabel(f"Messwerte in {unit}")
+        title.setStyleSheet(
+            "QLabel {color: %s; font-weight: 600; font-size: 16px;}" % colors.PRIMARY_DARK
+        )
+        layout.addWidget(title)
+
+        self.plot = pg.PlotWidget(background=colors.BACKGROUND)
+        self.plot.showGrid(x=True, y=True, alpha=0.25)
+        self.plot.getPlotItem().getAxis("left").setPen(pg.mkPen(colors.MUTED_TEXT))
+        self.plot.getPlotItem().getAxis("bottom").setPen(pg.mkPen(colors.MUTED_TEXT))
+        self.plot.getPlotItem().getAxis("left").setTextPen(pg.mkPen(colors.MUTED_TEXT))
+        self.plot.getPlotItem().getAxis("bottom").setTextPen(pg.mkPen(colors.MUTED_TEXT))
+        self.plot.setLabel("left", f"Wert [{unit}]")
+        self.plot.setLabel("bottom", "Zeit", "s")
+        self.plot.addLegend()
+        layout.addWidget(self.plot, 1)
+
+        self.hide()
 
 class MetaWidget(QtWidgets.QWidget):
     """Zeigt Meta-Informationen des aktuellen Blocks."""
@@ -107,40 +350,6 @@ class StatusBadgeBar(QtWidgets.QWidget):
             self.hide()
 
 
-class SeriesSelector(QtWidgets.QWidget):
-    """Checkboxen zur Auswahl der Kurven."""
-
-    toggled = QtCore.Signal(str, bool)
-
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
-        super().__init__(parent)
-        layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-        self._boxes: Dict[str, QtWidgets.QCheckBox] = {}
-        self.setLayout(layout)
-
-    def set_series(self, keys: Iterable[str], active: Iterable[str]) -> None:
-        layout = self.layout()
-        assert isinstance(layout, QtWidgets.QHBoxLayout)
-        active_set = set(active)
-        for key in keys:
-            if key in self._boxes:
-                box = self._boxes[key]
-            else:
-                info = PARAMETERS.get(key)
-                label = f"{key} – {info.description}" if info else key
-                box = QtWidgets.QCheckBox(label)
-                box.setStyleSheet(
-                    "QCheckBox {color: %s;} QCheckBox::indicator { width: 18px; height: 18px;}"
-                    % colors.TEXT
-                )
-                box.toggled.connect(lambda state, k=key: self.toggled.emit(k, state))
-                layout.addWidget(box)
-                self._boxes[key] = box
-            box.setChecked(key in active_set)
-
-
 class MainWindow(QtWidgets.QMainWindow):
     """Zentrales Fenster mit Plot, Tabelle und Metadaten."""
 
@@ -149,13 +358,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.databus = databus
         self.config = config
         self.setWindowTitle("WeTech Telemetrie Monitor")
-        self.resize(1280, 720)
-        self._curves: Dict[str, pg.PlotDataItem] = {}
-        self._plot_candidates: List[str] = [
-            key for key, info in PARAMETERS.items() if info.unit or key in SERIES_DEFAULT
-        ]
-        self._series_active: List[str] = [k for k in SERIES_DEFAULT if k in self._plot_candidates]
+        self.resize(1360, 780)
         self._x_key = "P06"
+        self._parameter_order: List[str] = list(PARAMETERS.keys())
+        self._parameter_settings: Dict[str, ParameterSetting] = self._default_parameter_settings()
+        self._curves: Dict[str, pg.PlotDataItem] = {}
+        self._curve_units: Dict[str, str] = {}
+        self._unit_plots: Dict[str, UnitPlot] = {}
 
         self._init_palette()
         self._init_ui()
@@ -164,6 +373,26 @@ class MainWindow(QtWidgets.QMainWindow):
         interval = max(15, int(1000 / max(1.0, config.ui_refresh_hz)))
         self._timer.timeout.connect(self.refresh)
         self._timer.start(interval)
+
+    def _default_parameter_settings(self) -> Dict[str, ParameterSetting]:
+        settings: Dict[str, ParameterSetting] = {}
+        for key in self._parameter_order:
+            info = PARAMETERS[key]
+            allow_graph = bool(info.unit) and key != self._x_key
+            visible = key in SERIES_DEFAULT
+            show_in_graph = visible and allow_graph
+            show_in_table = visible
+            settings[key] = ParameterSetting(
+                key=key,
+                label=info.description,
+                unit=info.unit,
+                color=self._color_for_key(key),
+                visible=visible,
+                show_in_graph=show_in_graph,
+                show_in_table=show_in_table,
+                allow_graph=allow_graph,
+            )
+        return settings
 
     def _init_palette(self) -> None:
         palette = self.palette()
@@ -176,36 +405,58 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setPalette(palette)
 
     def _init_ui(self) -> None:
+        pg.setConfigOptions(antialias=True)
+
         central = QtWidgets.QWidget(self)
-        central_layout = QtWidgets.QVBoxLayout(central)
+        central_layout = QtWidgets.QHBoxLayout(central)
         central_layout.setContentsMargins(12, 12, 12, 12)
-        central_layout.setSpacing(10)
+        central_layout.setSpacing(12)
+
+        self.sidebar = ParameterSidebar()
+        self.sidebar.populate(self._parameter_settings.values())
+        self.sidebar.changed.connect(self._on_parameter_setting_changed)
+        central_layout.addWidget(self.sidebar)
+
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
 
         header = QtWidgets.QLabel("WTC3 Telemetrie")
         header.setStyleSheet(
-            "font-size: 24px; font-weight: 600; color: %s; letter-spacing: 0.5px;" % colors.PRIMARY
+            "font-size: 26px; font-weight: 600; color: %s; letter-spacing: 0.5px;" % colors.PRIMARY
         )
-        central_layout.addWidget(header)
+        content_layout.addWidget(header)
 
         self.status_badges = StatusBadgeBar(self.config)
-        central_layout.addWidget(self.status_badges)
+        content_layout.addWidget(self.status_badges)
 
         self.meta_widget = MetaWidget()
-        central_layout.addWidget(self.meta_widget)
+        content_layout.addWidget(self.meta_widget)
 
-        self.selector = SeriesSelector()
-        self.selector.set_series(self._plot_candidates, self._series_active)
-        self.selector.toggled.connect(self._on_toggle_series)
-        central_layout.addWidget(self.selector)
+        self._plots_scroll = QtWidgets.QScrollArea()
+        self._plots_scroll.setWidgetResizable(True)
+        self._plots_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._plots_scroll.setStyleSheet("QScrollArea {border: none;}")
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        central_layout.addWidget(splitter, 1)
+        plots_container = QtWidgets.QWidget()
+        self._plots_layout = QtWidgets.QVBoxLayout(plots_container)
+        self._plots_layout.setContentsMargins(0, 0, 0, 0)
+        self._plots_layout.setSpacing(16)
 
-        self.plot = self._create_plot()
-        splitter.addWidget(self.plot)
+        for unit in self._available_units():
+            unit_plot = UnitPlot(unit)
+            self._unit_plots[unit] = unit_plot
+            self._plots_layout.addWidget(unit_plot)
+
+        self._plots_layout.addStretch(1)
+        self._plots_scroll.setWidget(plots_container)
+        content_layout.addWidget(self._plots_scroll, 1)
 
         self.table = self._create_table()
-        splitter.addWidget(self.table)
+        content_layout.addWidget(self.table)
+
+        central_layout.addWidget(content, 1)
 
         central.setLayout(central_layout)
         self.setCentralWidget(central)
@@ -224,23 +475,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.setStyleSheet("color: %s" % colors.MUTED_TEXT)
         self.status.showMessage("Bereit")
 
-    def _create_plot(self) -> pg.PlotWidget:
-        pg.setConfigOptions(antialias=True)
-        plot = pg.PlotWidget(background=colors.BACKGROUND)
-        plot.getPlotItem().getAxis("left").setPen(pg.mkPen(colors.MUTED_TEXT))
-        plot.getPlotItem().getAxis("bottom").setPen(pg.mkPen(colors.MUTED_TEXT))
-        plot.getPlotItem().getAxis("left").setTextPen(pg.mkPen(colors.MUTED_TEXT))
-        plot.getPlotItem().getAxis("bottom").setTextPen(pg.mkPen(colors.MUTED_TEXT))
-        plot.showGrid(x=True, y=True, alpha=0.2)
-        return plot
+        self._configure_table_headers()
+        self._update_plot_visibility()
+
+    def _available_units(self) -> List[str]:
+        units = {info.unit for info in PARAMETERS.values() if info.unit}
+        return sorted(units)
 
     def _create_table(self) -> QtWidgets.QTableWidget:
         table = QtWidgets.QTableWidget()
-        table.setColumnCount(len(self._series_active) + 1)
-        headers = ["Zeit (P06)"] + [
-            PARAMETERS[key].description if key in PARAMETERS else key for key in self._series_active
-        ]
-        table.setHorizontalHeaderLabels(headers)
         table.horizontalHeader().setStretchLastSection(True)
         table.verticalHeader().setVisible(False)
         table.setAlternatingRowColors(True)
@@ -251,20 +494,66 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         return table
 
-    def _on_toggle_series(self, key: str, state: bool) -> None:
-        if state:
-            if key not in self._series_active:
-                self._series_active.append(key)
-        else:
-            if key in self._series_active:
-                self._series_active.remove(key)
-        self._series_active = [k for k in self._plot_candidates if k in self._series_active]
-        self.table.setColumnCount(len(self._series_active) + 1)
-        headers = ["Zeit (P06)"] + [
-            PARAMETERS[key].description if key in PARAMETERS else key for key in self._series_active
-        ]
+    def _configure_table_headers(self) -> List[str]:
+        keys = self._active_table_keys()
+        headers = [f"Zeit ({self._x_key})"]
+        for key in keys:
+            setting = self._parameter_settings[key]
+            headers.append(f"{key} – {setting.label}")
+        self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
-        self.status.showMessage(f"Aktive Serien: {', '.join(self._series_active)}", 3000)
+        return keys
+
+    def _active_table_keys(self) -> List[str]:
+        return [
+            key
+            for key in self._parameter_order
+            if (setting := self._parameter_settings.get(key))
+            and setting.visible
+            and setting.show_in_table
+        ]
+
+    def _active_graph_keys(self) -> List[str]:
+        return [
+            key
+            for key in self._parameter_order
+            if (setting := self._parameter_settings.get(key))
+            and setting.visible
+            and setting.show_in_graph
+            and setting.unit
+        ]
+
+    def _active_units(self) -> Dict[str, List[str]]:
+        units: Dict[str, List[str]] = {}
+        for key in self._active_graph_keys():
+            unit = self._parameter_settings[key].unit
+            assert unit is not None
+            units.setdefault(unit, []).append(key)
+        return units
+
+    def _update_plot_visibility(self) -> None:
+        active_units = self._active_units()
+        for unit, widget in self._unit_plots.items():
+            widget.setVisible(unit in active_units)
+
+    def _on_parameter_setting_changed(self, key: str, setting: ParameterSetting) -> None:
+        self._parameter_settings[key] = setting
+        if not setting.visible or not setting.show_in_graph:
+            self._remove_curve(key)
+        else:
+            self._apply_curve_color(key)
+        table_keys = self._configure_table_headers()
+        self._update_plot_visibility()
+        state = "aktiv" if setting.visible else "inaktiv"
+        graph_flag = "ja" if setting.show_in_graph else "nein"
+        table_flag = "ja" if setting.show_in_table else "nein"
+        self.status.showMessage(
+            f"{setting.key} {state} – Liste: {table_flag}, Graph: {graph_flag}",
+            2500,
+        )
+        # Falls Spaltenanzahl sich verringert hat, vorhandene Items zurücksetzen
+        if not table_keys:
+            self.table.clearContents()
 
     def refresh(self) -> None:
         records = self.databus.snapshot()
@@ -289,21 +578,40 @@ class MainWindow(QtWidgets.QMainWindow):
         return x_vals
 
     def _update_curves(self, x_data: List[float], records: List[Dict[str, Number | str]]) -> None:
-        for key in self._series_active:
-            y_vals: List[float] = []
-            for record in records:
-                value = record.get(key)
-                if isinstance(value, (int, float)):
-                    y_vals.append(float(value))
-            if key not in self._curves:
-                color = self._color_for_key(key)
-                pen = pg.mkPen(color=color, width=2)
-                self._curves[key] = self.plot.plot(name=key, pen=pen)
-            self._curves[key].setData(x_data[: len(y_vals)], y_vals)
-        # Ausblenden nicht aktiver Kurven
+        active_units = self._active_units()
+        active_keys = {key for keys in active_units.values() for key in keys}
+
         for key in list(self._curves.keys()):
-            if key not in self._series_active:
-                self.plot.removeItem(self._curves.pop(key))
+            if key not in active_keys:
+                self._remove_curve(key)
+
+        for unit, keys in active_units.items():
+            plot_widget = self._unit_plots[unit]
+            plot_widget.setVisible(True)
+            plot = plot_widget.plot
+            for key in keys:
+                xs: List[float] = []
+                ys: List[float] = []
+                for x_value, record in zip(x_data, records):
+                    value = record.get(key)
+                    if isinstance(value, (int, float)):
+                        xs.append(x_value)
+                        ys.append(float(value))
+                color = QtGui.QColor(self._parameter_settings[key].color)
+                pen = pg.mkPen(color=color, width=2)
+                if key not in self._curves:
+                    label = f"{key} – {self._parameter_settings[key].label}"
+                    curve = plot.plot(name=label, pen=pen)
+                    self._curves[key] = curve
+                    self._curve_units[key] = unit
+                else:
+                    curve = self._curves[key]
+                    curve.setPen(pen)
+                self._curves[key].setData(xs, ys)
+
+        for unit, widget in self._unit_plots.items():
+            if unit not in active_units:
+                widget.hide()
 
     def _color_for_key(self, key: str) -> str:
         palette = [colors.PRIMARY, colors.PRIMARY_LIGHT, colors.ACCENT, "#3DC1D3", "#6A67CE", "#FFB347"]
@@ -311,21 +619,33 @@ class MainWindow(QtWidgets.QMainWindow):
         return palette[idx]
 
     def _update_table(self, records: List[Dict[str, Number | str]]) -> None:
+        table_keys = self._configure_table_headers()
         rows = min(100, len(records))
         self.table.setRowCount(rows)
         recent = records[-rows:]
-        active_keys = list(self._series_active)
         for r, record in enumerate(recent):
-            time_value = record.get("P06", "-")
+            time_value = record.get(self._x_key, "-")
             self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(time_value)))
-            for c, key in enumerate(active_keys, start=1):
+            for c, key in enumerate(table_keys, start=1):
                 value = record.get(key, "-")
                 if isinstance(value, float):
                     display = f"{value:.2f}"
                 else:
                     display = str(value)
                 self.table.setItem(r, c, QtWidgets.QTableWidgetItem(display))
-        self.table.scrollToBottom()
+        if rows:
+            self.table.scrollToBottom()
+
+    def _remove_curve(self, key: str) -> None:
+        item = self._curves.pop(key, None)
+        unit = self._curve_units.pop(key, None)
+        if item and unit and unit in self._unit_plots:
+            self._unit_plots[unit].plot.removeItem(item)
+
+    def _apply_curve_color(self, key: str) -> None:
+        if key in self._curves:
+            color = QtGui.QColor(self._parameter_settings[key].color)
+            self._curves[key].setPen(pg.mkPen(color=color, width=2))
 
     def _open_csv(self) -> None:
         path = self.config.persist_path
