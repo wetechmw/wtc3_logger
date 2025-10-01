@@ -225,7 +225,8 @@ def render_measurement_report(
     printer.setPageMargins(QtCore.QMarginsF(12, 16, 12, 16))
     printer.setOutputFileName(str(target))
 
-    doc.setPageSize(QtCore.QSizeF(printer.pageRect().size()))
+    page_rect = printer.pageRect(QPrinter.Unit.Point)
+    doc.setPageSize(page_rect.size())
     doc.print(printer)
 
 
