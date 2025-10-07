@@ -6,14 +6,18 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6 import QtWidgets
+from PySide6 import QtWidgets, QtGui
 
+from .acquisition import AcquisitionController
 from .config import AppConfig, DEFAULT_CONFIG, SerialConfig
 from .databus import DataBus
-from .parser import Parser
-from .serial_reader import FileTail, SerialReader
 from .ui import MainWindow
 
+
+
+def _resource_path(*parts: str) -> Path:
+    base = getattr(sys, '_MEIPASS', Path(__file__).resolve().parents[1])
+    return Path(base, *parts)
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="WTC3 Telemetrie Visualisierung")
@@ -22,7 +26,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baud", type=int, help="Baudrate", default=None)
     parser.add_argument("--sample", action="store_true", help="Beispieldatei streamen")
     parser.add_argument("--sample-file", type=Path, help="Alternative Beispieldatei", default=None)
-    parser.add_argument("--persist", action="store_true", help="Messwerte als CSV persistieren")
+    parser.add_argument("--persist", action="store_true", help="Enable raw data logging")
     return parser
 
 
@@ -54,42 +58,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = arg_parser.parse_args(argv)
     config = load_config(args)
 
-    persist_path = config.persist_path if config.persist_csv else None
-    databus = DataBus(maxlen=config.max_points, persist_path=persist_path)
-
-    parser = Parser()
-    parser.on_record(databus.append)
-    parser.on_data_header(lambda _: databus.reset())
-
-    threads: list[FileTail | SerialReader] = []
-    if config.sample_file and config.sample_file.exists():
-        tail = FileTail(config.sample_file, parser.feed_line, loop=True)
-        tail.start()
-        threads.append(tail)
-    elif config.serial.enabled and config.serial.port:
-        try:
-            reader = SerialReader(
-                config.serial.port,
-                config.serial.baudrate,
-                config.serial.newline,
-                parser.feed_line,
-            )
-        except Exception as exc:  # pragma: no cover - hardware spezifisch
-            print(f"Serielle Verbindung fehlgeschlagen: {exc}", file=sys.stderr)
-        else:
-            reader.start()
-            threads.append(reader)
-    else:
-        print("Keine Datenquelle konfiguriert. Verwende --sample oder --port.")
+    databus = DataBus(maxlen=config.max_points)
+    controller = AcquisitionController(config, databus)
 
     app = QtWidgets.QApplication(sys.argv)
-    window = MainWindow(databus, config)
+    icon_path = _resource_path("assets", "Icon.png")
+    if icon_path.exists():
+        app.setWindowIcon(QtGui.QIcon(str(icon_path)))
+    window = MainWindow(databus, config, controller)
     window.showMaximized()
+    controller.start()
     exit_code = app.exec()
 
-    for thread in threads:
-        thread.stop()
-        thread.join(timeout=1.0)
+    controller.stop()
     return int(exit_code)
 
 

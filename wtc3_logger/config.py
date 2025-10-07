@@ -1,7 +1,7 @@
 """Konfigurationsmodelle für den WTC3 Logger."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict, replace
 from pathlib import Path
 from typing import Optional
 
@@ -33,8 +33,8 @@ class AppConfig:
 
     serial: SerialConfig = field(default_factory=SerialConfig)
     sample_file: Optional[Path] = None
-    persist_csv: bool = False
-    persist_path: Path = field(default_factory=lambda: Path.cwd() / "logs" / "wtc3_log.csv")
+    persist_csv: bool = True
+    persist_path: Path = field(default_factory=lambda: Path.cwd() / "logs" / "wtc3_raw.tsv")
     ui_refresh_hz: float = 15.0
     max_points: int = 10_000
     status_bits: dict[int, str] = field(default_factory=dict)
@@ -56,7 +56,7 @@ class AppConfig:
             enabled=bool(serial_data.get("enabled", False)),
         )
         sample = data.get("sample_file")
-        persist = data.get("persist_csv", False)
+        persist = data.get("persist_csv", True)
         persist_path = data.get("persist_path")
         status_bits_raw = data.get("status_bits", {})
         status_bits: dict[int, str] = {}
@@ -76,7 +76,7 @@ class AppConfig:
             serial=serial,
             sample_file=_expand(sample),
             persist_csv=bool(persist),
-            persist_path=_expand(persist_path) if persist_path else Path.cwd() / "logs" / "wtc3_log.csv",
+            persist_path=_expand(persist_path) if persist_path else Path.cwd() / "logs" / "wtc3_raw.tsv",
             ui_refresh_hz=float(data.get("ui_refresh_hz", 15.0)),
             max_points=int(data.get("max_points", 10_000)),
             status_bits=status_bits,

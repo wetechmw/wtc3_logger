@@ -2,22 +2,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
+import unicodedata
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from ..acquisition import AcquisitionController
 from ..config import AppConfig
+from ..preferences import load_preferences, save_preferences
 from ..databus import DataBus
 from ..parser import PARAMETERS, Number
 from ..status import StatusDetail, decode_status, label_strategy
 from . import colors
-from .pdf_report import ParameterStatistic, render_measurement_report
+from .config_dialog import ConfigDialog
+from .pdf_report import ParameterSeries, ParameterStatistic, StatusMarker, render_measurement_report
 
 
-SERIES_DEFAULT: List[str] = []
+SERIES_DEFAULT: List[str] = ["P44", "P45", "P54", "P55", "P61"]
 META_PARAMETER_KEYS = {
     "P04",
     "P05",
@@ -40,6 +44,66 @@ META_PARAMETER_KEYS = {
     "P92",
 }
 
+STATUS_FIELD_TRANSLATIONS = {
+    "batteriespannung": "Battery Voltage",
+    "batterietemperatur": "Battery Temperature",
+    "innenwiderstand": "Internal Resistance",
+    "versorgung": "Supply",
+    "ladestrom": "Charge Current",
+    "fehler": "Fault",
+    "peripherie": "Peripheral",
+    "nicd eoc": "NiCd End of Charge",
+}
+
+def _normalize_status_label(text: str) -> str:
+    cleaned = text.strip()
+    cleaned = cleaned.replace("\u0394", "Delta ")
+    cleaned = cleaned.replace("ΔV", "Delta V").replace("ΔT", "Delta T")
+    cleaned = cleaned.replace("Δ", "Delta ")
+    normalized = unicodedata.normalize("NFKD", cleaned).encode("ascii", "ignore").decode("ascii")
+    normalized = " ".join(normalized.split()).lower()
+    return normalized
+
+STATUS_VALUE_TRANSLATIONS = {
+    "tiefentladen": "Deep Discharged",
+    "niedrig": "Low",
+    "normal": "Normal",
+    "voll": "Full",
+    "uberspannung": "Over Voltage",
+    "ladeende": "Charge Complete",
+    "kalt": "Cold",
+    "kuhl": "Cool",
+    "warm": "Warm",
+    "heiss": "Hot",
+    "hoch": "High",
+    "aus": "Off",
+    "10%": "10%",
+    "20%": "20%",
+    "50%": "50%",
+    "100%": "100%",
+    "nicht verwendet": "Not Used",
+    "keine fehler": "No Faults",
+    "geringe kapazitat": "Low Capacity",
+    "hohe kapazitat": "High Capacity",
+    "temperaturdurchgang": "Temperature Fault",
+    "hoher widerstand": "High Resistance",
+    "eingang aktiviert": "Input Enabled",
+    "ausgang aktiviert": "Output Enabled",
+    "regler aktiv": "Regulator Active",
+    "referenz aktiv": "Reference Active",
+    "sleep aktiv": "Sleep Active",
+    "delta v drop erreicht": "Delta V reached",
+    "delta t anstieg": "Delta T rise",
+    "max. spannungsabfall": "Max voltage drop",
+    "hohe temperatur": "High temperature",
+}
+
+
+
+
+
+
+
 
 @dataclass(slots=True)
 class ParameterSetting:
@@ -54,16 +118,35 @@ class ParameterSetting:
 
 
 class ColorIndicator(QtWidgets.QFrame):
-    """Passives Farbfeld, das die Linienfarbe zeigt."""
+    """Editable color swatch that emits a signal when clicked."""
+
+    clicked = QtCore.Signal()
 
     def __init__(self, color: str, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self._color = QtGui.QColor(color)
         self.setFixedSize(18, 18)
+        self._apply_style()
+
+    def _apply_style(self) -> None:
         self.setStyleSheet(
             "QFrame {border-radius: 9px; border: 2px solid %s; background-color: %s;}"
             % (colors.PRIMARY_LIGHT, self._color.name())
         )
+
+    def set_color(self, color: QtGui.QColor) -> None:
+        if not color.isValid():
+            return
+        self._color = color
+        self._apply_style()
+
+    def color(self) -> QtGui.QColor:
+        return QtGui.QColor(self._color)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
 
 class ParameterRow(QtWidgets.QWidget):
@@ -71,9 +154,18 @@ class ParameterRow(QtWidgets.QWidget):
 
     changed = QtCore.Signal(ParameterSetting)
 
-    def __init__(self, setting: ParameterSetting, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self,
+        setting: ParameterSetting,
+        on_color_change: Callable[[str, str], None] | None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._setting = setting
+        if on_color_change is None:
+            self._on_color_change: Callable[[str, str], None] = lambda _k, _c: None
+        else:
+            self._on_color_change = on_color_change
 
         container = QtWidgets.QFrame()
         container.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
@@ -98,16 +190,24 @@ class ParameterRow(QtWidgets.QWidget):
         )
         layout.addWidget(self._info_label, 1)
 
-        self._value_label = QtWidgets.QLabel("–")
+        self._value_label = QtWidgets.QLabel('---.---   ')
         self._value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        fixed_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        self._value_label.setFont(fixed_font)
+        metrics = QtGui.QFontMetrics(fixed_font)
+        sample_width = metrics.horizontalAdvance('9999.999 XXX')
+        self._value_label.setMinimumWidth(sample_width + 12)
         self._value_label.setStyleSheet(
             "QLabel {color: %s; font-weight: 600; background: %s; border-radius: 8px; padding: 4px 10px;}"
             % (colors.PRIMARY_DARK, colors.BACKGROUND)
         )
+        self._value_label.setText(self._value_label.text().replace(' ', '\u00A0'))
         layout.addWidget(self._value_label)
 
         indicator = ColorIndicator(setting.color)
         indicator.setToolTip("Linienfarbe im Diagramm")
+        indicator.clicked.connect(self._open_color_dialog)
+        self._color_indicator = indicator
         layout.addWidget(indicator)
 
         wrapper = QtWidgets.QHBoxLayout(self)
@@ -115,6 +215,20 @@ class ParameterRow(QtWidgets.QWidget):
         wrapper.addWidget(container)
 
         self._update_enabled_state()
+
+    def set_color(self, color_hex: str) -> None:
+        self._color_indicator.set_color(QtGui.QColor(color_hex))
+        self._setting = replace(self._setting, color=color_hex)
+
+    def _open_color_dialog(self) -> None:
+        current = self._color_indicator.color()
+        chosen = QtWidgets.QColorDialog.getColor(current, self, "Select color")
+        if not chosen.isValid():
+            return
+        color_hex = chosen.name()
+        self.set_color(color_hex)
+        self._on_color_change(self._setting.key, color_hex)
+
 
     def setting(self) -> ParameterSetting:
         return self._setting
@@ -139,18 +253,84 @@ class ParameterRow(QtWidgets.QWidget):
             )
 
     def update_value(self, display_value: str) -> None:
-        self._value_label.setText(display_value)
+        self._value_label.setText(display_value.replace(' ', '\u00A0'))
 
+
+
+
+class ConfigurationWarningOverlay(QtWidgets.QFrame):
+    """Centered warning shown when acquisition config is incomplete."""
+
+    def __init__(self, parent: QtWidgets.QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("configurationWarningOverlay")
+        self.setStyleSheet(
+            "QFrame#configurationWarningOverlay {background: rgba(255, 255, 255, 210);}"  # translucent backdrop
+        )
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+        panel = QtWidgets.QFrame()
+        panel.setStyleSheet(
+            "QFrame {background: %s; border: 2px solid %s; border-radius: 14px; padding: 26px 36px;}"
+            % (colors.BACKGROUND, colors.ACCENT)
+        )
+        inner = QtWidgets.QVBoxLayout(panel)
+        inner.setSpacing(12)
+        inner.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+        title = QtWidgets.QLabel("Configuration incomplete")
+        title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet(
+            "QLabel {color: %s; font-size: 20px; font-weight: 600;}" % colors.ACCENT
+        )
+        inner.addWidget(title)
+
+        self._message = QtWidgets.QLabel()
+        self._message.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self._message.setWordWrap(True)
+        self._message.setStyleSheet(
+            "QLabel {color: %s; font-size: 13px;}" % colors.TEXT
+        )
+        inner.addWidget(self._message)
+
+        hint = QtWidgets.QLabel("Open the data source settings to select a COM port or sample file.")
+        hint.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        hint.setWordWrap(True)
+        hint.setStyleSheet("QLabel {color: %s;}" % colors.MUTED_TEXT)
+        inner.addWidget(hint)
+
+        layout.addWidget(panel)
+        self.hide()
+
+    def set_message(self, message: str) -> None:
+        self._message.setText(message)
+
+    def update_geometry(self) -> None:
+        if self.parent() is not None:
+            self.setGeometry(self.parent().rect())
 
 class ParameterSidebar(QtWidgets.QWidget):
     """Zusammenklappbare Sidebar zur Parameterauswahl."""
 
     changed = QtCore.Signal(str, ParameterSetting)
+    preferred_width_changed = QtCore.Signal(int)
 
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self,
+        on_color_change: Callable[[str, str], None] | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
+        if on_color_change is None:
+            self._on_color_change: Callable[[str, str], None] = lambda _k, _c: None
+        else:
+            self._on_color_change = on_color_change
         self._rows: Dict[str, ParameterRow] = {}
         self._values: Dict[str, str] = {}
+        self._preferred_width: int = 360
 
         self.setAutoFillBackground(True)
         palette = self.palette()
@@ -227,7 +407,7 @@ class ParameterSidebar(QtWidgets.QWidget):
             )
             self._scroll_layout.addWidget(unit_label)
             for setting in sorted(unit_entries, key=lambda s: s.label):
-                row = ParameterRow(setting)
+                row = ParameterRow(setting, self._on_color_change)
                 row.changed.connect(self._on_row_changed)
                 self._scroll_layout.addWidget(row)
                 self._rows[setting.key] = row
@@ -246,21 +426,39 @@ class ParameterSidebar(QtWidgets.QWidget):
         )
         self._scroll.setVisible(expanded)
         if expanded:
+            self.setMinimumWidth(220)
+            self.setMaximumWidth(900)
             self._update_dynamic_width(force=True)
         else:
             collapsed = max(48, self._toggle.sizeHint().width() + 16)
             self.setMinimumWidth(collapsed)
             self.setMaximumWidth(collapsed)
+            self.preferred_width_changed.emit(collapsed)
 
     def _update_dynamic_width(self, force: bool = False) -> None:
         self._scroll_content.adjustSize()
         content_width = self._scroll_content.sizeHint().width()
         scrollbar_width = self._scroll.verticalScrollBar().sizeHint().width()
-        width = content_width + scrollbar_width + 24
-        width = max(260, min(520, width))
-        if force or self._toggle.isChecked():
-            self.setMinimumWidth(width)
-            self.setMaximumWidth(width)
+        preferred = content_width + scrollbar_width + 24
+        preferred = max(260, min(560, preferred))
+        previous = self._preferred_width
+        self._preferred_width = preferred
+        if self._toggle.isChecked():
+            self.setMinimumWidth(220)
+            self.setMaximumWidth(900)
+            if force or previous != preferred:
+                self.preferred_width_changed.emit(preferred)
+        elif force:
+            collapsed = max(48, self._toggle.sizeHint().width() + 16)
+            self.preferred_width_changed.emit(collapsed)
+
+    def preferred_width(self) -> int:
+        if self._toggle.isChecked():
+            return self._preferred_width
+        return max(48, self._toggle.sizeHint().width() + 16)
+
+    def is_expanded(self) -> bool:
+        return self._toggle.isChecked()
 
     def update_value(self, key: str, value: Number | str | None, unit: str | None) -> None:
         formatted = self._format_value(value, unit)
@@ -272,27 +470,43 @@ class ParameterSidebar(QtWidgets.QWidget):
     def clear_values(self) -> None:
         self._values.clear()
         for row in self._rows.values():
-            row.update_value("–")
+            placeholder = self._format_value(None, row.setting().unit)
+            row.update_value(placeholder)
+
+
+    def apply_color(self, key: str, color_hex: str) -> None:
+        row = self._rows.get(key)
+        if row:
+            row.set_color(color_hex)
 
     def forget_value(self, key: str) -> None:
         self._values.pop(key, None)
 
     def _apply_value_to_row(self, key: str) -> None:
-        value = self._values.get(key, "–")
         row = self._rows.get(key)
-        if row:
-            row.update_value(value)
+        if not row:
+            return
+        value = self._values.get(key)
+        if value is None:
+            value = self._format_value(None, row.setting().unit)
+        row.update_value(value)
 
     def _format_value(self, value: Number | str | None, unit: str | None) -> str:
+        def _nb(text: str) -> str:
+            return text.replace(' ', '\u00A0')
+
         if value is None:
-            return "–"
-        if isinstance(value, float):
-            text = ("%.3f" % value).rstrip("0").rstrip(".")
+            numeric = '---.---'
+        elif isinstance(value, (int, float)):
+            numeric = f"{float(value):7.3f}"
         else:
             text = str(value)
-        if unit:
-            return f"{text} {unit}"
-        return text
+            numeric = text[:7].rjust(7)
+
+        unit_text = (unit or '')[:3]
+        unit_block = unit_text.rjust(3) if unit_text else '   '
+        return _nb(f"{numeric} {unit_block}")
+
 
 
 class UnitPlot(QtWidgets.QFrame):
@@ -321,8 +535,11 @@ class UnitPlot(QtWidgets.QFrame):
         self.plot.getPlotItem().getAxis("left").setTextPen(pg.mkPen(colors.MUTED_TEXT))
         self.plot.getPlotItem().getAxis("bottom").setTextPen(pg.mkPen(colors.MUTED_TEXT))
         self.plot.setLabel("bottom", "Zeit", "s")
-        self.plot.addLegend()
-        layout.addWidget(self.plot, 1)
+        legend = self.plot.addLegend()
+        if legend is not None:
+            legend.anchor((1, 1), (1, 1))
+            legend.setOffset((-10, -10))
+        layout.addWidget(self.plot, stretch=1)
 
         self._unit: str | None = None
         if unit:
@@ -564,6 +781,9 @@ class StatusBadgeBar(QtWidgets.QWidget):
         self.setLayout(layout)
         self.hide()
 
+    def set_config(self, config: AppConfig) -> None:
+        self._config = config
+
     def update_state(self, meta: Dict[str, str], status_detail: StatusDetail | None) -> None:
         strategy_code = meta.get("P04")
         friendly = label_strategy(strategy_code, self._config.strategy_labels)
@@ -603,13 +823,24 @@ class StatusBadgeBar(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     """Zentrales Fenster mit Plot, Tabelle und Metadaten."""
 
-    def __init__(self, databus: DataBus, config: AppConfig, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(self, databus: DataBus, config: AppConfig, controller: AcquisitionController | None = None, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.databus = databus
-        self.config = config
+        self._controller = controller
+        self.config = controller.config if controller else config
+        self._open_raw_action: QtGui.QAction | None = None
+        self._pdf_action: QtGui.QAction | None = None
+        self._config_action: QtGui.QAction | None = None
+        self._config_warning: ConfigurationWarningOverlay | None = None
+        self._auto_stop_checkbox: QtWidgets.QCheckBox | None = None
         self.setWindowTitle("WeTech Telemetrie Monitor")
         self.resize(1360, 780)
         self._x_key = "P06"
+        self._preferences = load_preferences()
+        self._auto_stop_enabled = bool(self._preferences.get('auto_stop_full_battery', False))
+        self._auto_stop_since: datetime | None = None
+        self._auto_stop_triggered = False
+        self._color_overrides: Dict[str, str] = self._preferences.get('parameter_colors', {})
         self._parameter_order: List[str] = list(PARAMETERS.keys())
         self._parameter_settings: Dict[str, ParameterSetting] = self._default_parameter_settings()
         self._curves: Dict[str, pg.PlotDataItem] = {}
@@ -618,14 +849,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_records: List[Dict[str, Number | str]] = []
         self._auto_initialized: set[str] = set()
         self._meta_keys: set[str] = set(META_PARAMETER_KEYS)
+        self._main_splitter: QtWidgets.QSplitter | None = None
         self._seen_generation = self.databus.generation()
         self._temperature_limits: Tuple[float, float] | None = None
 
         self._init_palette()
         self._init_ui()
 
+        if self._controller:
+            self._controller.status_message.connect(self._handle_status_message)
+            self._controller.error_occurred.connect(self._handle_acquisition_error)
+            self._controller.config_changed.connect(self._on_config_changed)
+
+        self._refresh_action_state()
+
         self._timer = QtCore.QTimer(self)
-        interval = max(15, int(1000 / max(1.0, config.ui_refresh_hz)))
+        interval = max(15, int(1000 / max(1.0, self.config.ui_refresh_hz)))
         self._timer.timeout.connect(self.refresh)
         self._timer.start(interval)
 
@@ -677,10 +916,9 @@ class MainWindow(QtWidgets.QMainWindow):
         central_layout.setContentsMargins(16, 16, 16, 16)
         central_layout.setSpacing(16)
 
-        self.sidebar = ParameterSidebar()
+        self.sidebar = ParameterSidebar(self._on_row_color_change)
         self.sidebar.populate(self._ordered_settings())
         self.sidebar.changed.connect(self._on_parameter_setting_changed)
-        central_layout.addWidget(self.sidebar)
 
         content = QtWidgets.QWidget()
         content_layout = QtWidgets.QVBoxLayout(content)
@@ -710,7 +948,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plots_scroll.setWidget(self._plots_container)
         content_layout.addWidget(self._plots_scroll, 1)
 
-        central_layout.addWidget(content, 2)
+        self._main_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self._main_splitter.setChildrenCollapsible(False)
+        self._main_splitter.setHandleWidth(10)
+        self._main_splitter.addWidget(self.sidebar)
+        self._main_splitter.addWidget(content)
+        self._main_splitter.setStretchFactor(0, 0)
+        self._main_splitter.setStretchFactor(1, 1)
+        central_layout.addWidget(self._main_splitter, 3)
+
+        self.sidebar.preferred_width_changed.connect(self._apply_sidebar_width)
 
         self.meta_panel = MetaDetailPanel()
         self.meta_panel.setMinimumWidth(360)
@@ -718,26 +965,106 @@ class MainWindow(QtWidgets.QMainWindow):
 
         central.setLayout(central_layout)
         self.setCentralWidget(central)
+        central.installEventFilter(self)
+        self._config_warning = ConfigurationWarningOverlay(central)
+        self._config_warning.update_geometry()
 
-        toolbar = self.addToolBar("Aktionen")
+        toolbar = self.addToolBar("Actions")
         toolbar.setMovable(False)
         toolbar.setStyleSheet(
             "QToolBar {background: %s; spacing: 12px;} QToolButton {color: white; background: %s; border-radius: 6px; padding: 6px 12px;}"
             % (colors.PRIMARY_DARK, colors.PRIMARY)
         )
-        export_action = QtGui.QAction("CSV öffnen", self)
-        export_action.triggered.connect(self._open_csv)
-        toolbar.addAction(export_action)
+        if self._controller:
+            config_action = QtGui.QAction("Data Source...", self)
+            config_action.triggered.connect(self._open_config_dialog)
+            toolbar.addAction(config_action)
+            self._config_action = config_action
 
-        pdf_action = QtGui.QAction("Messprotokoll PDF", self)
+        export_action = QtGui.QAction("Open Raw Data", self)
+        export_action.triggered.connect(self._open_raw_data)
+        toolbar.addAction(export_action)
+        self._open_raw_action = export_action
+
+        pdf_action = QtGui.QAction("Export Report PDF", self)
         pdf_action.triggered.connect(self._export_pdf)
         toolbar.addAction(pdf_action)
+        self._pdf_action = pdf_action
+
+        toolbar.addSeparator()
+        auto_stop_box = QtWidgets.QCheckBox('Auto-stop (Full >=1 min)')
+        auto_stop_box.setChecked(self._auto_stop_enabled)
+        auto_stop_box.setToolTip('Stop acquisition when the battery reports a full state for 60 seconds.')
+        auto_stop_box.setStyleSheet('QCheckBox { color: white; font-weight: 500; }')
+        auto_stop_box.toggled.connect(self._toggle_auto_stop)
+        toolbar.addWidget(auto_stop_box)
+        self._auto_stop_checkbox = auto_stop_box
 
         self.status = self.statusBar()
         self.status.setStyleSheet("color: %s" % colors.MUTED_TEXT)
-        self.status.showMessage("Bereit")
+        self.status.showMessage("Ready")
 
+        QtCore.QTimer.singleShot(0, self._init_splitter_sizes)
         self._update_plot_visibility()
+
+    def _refresh_action_state(self) -> None:
+        if self._open_raw_action:
+            path: Path | None = None
+            if self._controller:
+                path = self._controller.raw_log_path()
+            if path is None and self.config.persist_csv:
+                path = self.config.persist_path
+            enabled = self.config.persist_csv and path is not None and Path(path).exists()
+            self._open_raw_action.setEnabled(enabled)
+        self._update_configuration_warning()
+
+    def _is_configuration_valid(self) -> bool:
+        serial = self.config.serial
+        if self.config.sample_file:
+            return True
+        if serial.enabled and serial.port:
+            return True
+        return False
+
+    def _configuration_issue_text(self) -> str:
+        serial = self.config.serial
+        if serial.enabled and not serial.port:
+            return "Serial data source is enabled but no COM port is configured."
+        return "No data source configured. Select a COM port or choose a sample file."
+
+    def _update_configuration_warning(self) -> None:
+        if not self._config_warning:
+            return
+        if self._is_configuration_valid():
+            self._config_warning.hide()
+            return
+        self._config_warning.set_message(self._configuration_issue_text())
+        self._config_warning.update_geometry()
+        self._config_warning.show()
+        self._config_warning.raise_()
+
+    def _apply_sidebar_width(self, width: int) -> None:
+        if not self._main_splitter:
+            return
+        sizes = self._main_splitter.sizes()
+        total = sum(sizes) if sizes and sum(sizes) > 0 else width + 600
+        width = max(width, self.sidebar.minimumWidth())
+        remaining = max(total - width, 1)
+        self._main_splitter.setSizes([width, remaining])
+
+    def _init_splitter_sizes(self) -> None:
+        if not self._main_splitter:
+            return
+        width = self.sidebar.preferred_width()
+        remaining = max(width * 2, 600)
+        self._main_splitter.setSizes([width, remaining])
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if obj is self.centralWidget() and event.type() in {QtCore.QEvent.Type.Resize, QtCore.QEvent.Type.Show}:
+            if self._config_warning:
+                self._config_warning.update_geometry()
+        return super().eventFilter(obj, event)
+
 
     def _active_graph_keys(self) -> List[str]:
         return [
@@ -809,6 +1136,60 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.sidebar.populate(self._ordered_settings())
 
+    def _on_row_color_change(self, key: str, color_hex: str) -> None:
+        self._color_overrides[key] = color_hex
+        self._preferences['parameter_colors'] = dict(self._color_overrides)
+        save_preferences(self._preferences)
+        if key in self._parameter_settings:
+            self._parameter_settings[key] = replace(self._parameter_settings[key], color=color_hex)
+        self.sidebar.apply_color(key, color_hex)
+        self._apply_curve_color(key)
+
+
+    def _toggle_auto_stop(self, enabled: bool) -> None:
+        self._auto_stop_enabled = bool(enabled)
+        self._preferences['auto_stop_full_battery'] = self._auto_stop_enabled
+        save_preferences(self._preferences)
+        self._auto_stop_since = None
+        self._auto_stop_triggered = False
+        status_text = "Auto-stop when battery is full for 1 minute"
+        status_state = "enabled" if self._auto_stop_enabled else "disabled"
+        self.status.showMessage(f"{status_text} {status_state}", 3000)
+
+
+    def _update_auto_stop(self, status_detail: StatusDetail | None) -> None:
+        if not self._auto_stop_enabled or self._controller is None:
+            self._auto_stop_since = None
+            return
+        if self._auto_stop_triggered:
+            return
+
+        raw_value = status_detail.raw_value if status_detail else None
+        is_full = False
+        if isinstance(raw_value, int):
+            battery_state = raw_value & 0b111
+            if battery_state in {3, 5}:
+                is_full = True
+
+        if is_full:
+            now = datetime.now()
+            if self._auto_stop_since is None:
+                self._auto_stop_since = now
+                return
+            if now - self._auto_stop_since >= timedelta(minutes=1):
+                self._auto_stop_triggered = True
+                self._auto_stop_since = None
+                try:
+                    self._controller.stop()
+                except Exception as exc:  # pragma: no cover - controller stop rarely fails
+                    self.status.showMessage(f"Stopping acquisition failed: {exc}", 6000)
+                else:
+                    self.status.showMessage("Acquisition stopped after battery was full for 60 seconds.", 5000)
+                self._refresh_action_state()
+        else:
+            self._auto_stop_since = None
+
+
     def _handle_meta_parameters(self, meta: Dict[str, str]) -> None:
         self._update_temperature_limits(meta)
 
@@ -854,25 +1235,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._temperature_limits = (lower, upper)
 
     def _auto_initialize_from_record(self, record: Dict[str, Number | str]) -> None:
-        changed = False
         for key in record.keys():
-            if key not in self._parameter_settings or key in self._auto_initialized:
+            if key not in self._parameter_settings:
                 continue
-            setting = self._parameter_settings[key]
-            if not setting.allow_graph:
-                self._auto_initialized.add(key)
-                continue
-            updated = replace(
-                setting,
-                visible=True,
-            )
-            if updated != setting:
-                self._parameter_settings[key] = updated
-                changed = True
             self._auto_initialized.add(key)
-        if changed:
-            self.sidebar.populate(self._ordered_settings())
-            self._update_plot_visibility()
 
     def refresh(self) -> None:
         generation = self.databus.generation()
@@ -886,11 +1252,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._last_records = records
         meta = self.databus.meta()
+        if self._controller:
+            self._controller.update_export_meta(meta)
         self._handle_meta_parameters(meta)
         last_record = records[-1]
-        status_detail = decode_status(last_record.get("P05"))
+        status_detail = decode_status(last_record.get("P05"), self.config.status_bits)
         self.status_badges.update_state(meta, status_detail)
         self.meta_panel.update_meta(meta, last_record.get("P05"), status_detail)
+        self._update_auto_stop(status_detail)
 
         self._auto_initialize_from_record(last_record)
         self._update_active_parameter_values(last_record)
@@ -901,6 +1270,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_data_reset(self) -> None:
         self._last_records = []
         self._auto_initialized.clear()
+        self._auto_stop_since = None
+        self._auto_stop_triggered = False
         for plot in self._unit_plots.values():
             plot.plot.clear()
         self._curves.clear()
@@ -991,7 +1362,40 @@ class MainWindow(QtWidgets.QMainWindow):
         # Sichtbare Einheiten sind bereits in _ensure_visible_units gespeichert
 
     def _color_for_key(self, key: str) -> str:
-        palette = [colors.PRIMARY, colors.PRIMARY_LIGHT, colors.ACCENT, "#3DC1D3", "#6A67CE", "#FFB347"]
+        override = getattr(self, '_color_overrides', {}).get(key)
+        if override:
+            return override
+        setting = getattr(self, '_parameter_settings', {}).get(key) if hasattr(self, '_parameter_settings') else None
+        info = PARAMETERS.get(key)
+        label = ''
+        if setting and setting.label:
+            label = setting.label.lower()
+        elif info and info.description:
+            label = info.description.lower()
+        unit = ''
+        if setting and setting.unit:
+            unit = setting.unit.lower()
+        elif info and info.unit:
+            unit = info.unit.lower()
+
+        battery_keys = {'P40','P41','P42','P45','P46','P72','P90','P91','P92','P50','P51','P52','P55','P56'}
+        control_keys = {'P43','P44','P53','P54','P57'}
+        temperature_keys = {'P60','P61','P62','P73','P74','P75','P76'}
+        resistance_keys = {'P80','P81'}
+
+        key_upper = key.upper()
+        if key_upper in battery_keys or 'batterie' in label or 'battery' in label:
+            return colors.PRIMARY
+        if key_upper in control_keys or 'stell' in label or 'control' in label:
+            return colors.SECONDARY
+        if key_upper in temperature_keys or 'temp' in label:
+            return colors.ACCENT
+        if key_upper in resistance_keys or 'widerstand' in label or 'resistance' in label:
+            return colors.SECONDARY_LIGHT
+        if 'leistung' in label or 'power' in label:
+            return colors.PRIMARY_LIGHT
+
+        palette = [colors.PRIMARY, colors.SECONDARY, colors.ACCENT, colors.SECONDARY_LIGHT, colors.PRIMARY_LIGHT, colors.TEXT]
         idx = hash(key) % len(palette)
         return palette[idx]
 
@@ -1006,10 +1410,120 @@ class MainWindow(QtWidgets.QMainWindow):
             color = QtGui.QColor(self._parameter_settings[key].color)
             self._curves[key].setPen(pg.mkPen(color=color, width=2))
 
-    def _open_csv(self) -> None:
-        path = self.config.persist_path
+    def _collect_series_for_pdf(
+        self, x_data: Sequence[float], stats: Sequence[ParameterStatistic]
+    ) -> List[ParameterSeries]:
+        def fmt(value: float) -> str:
+            text = ("%.3f" % value).rstrip("0").rstrip(".")
+            return text if text else "0"
+
+        series_list: List[ParameterSeries] = []
+        for stat in stats:
+            setting = self._parameter_settings.get(stat.key)
+            color = setting.color if setting else stat.color
+            xs: List[float] = []
+            ys: List[float] = []
+            for x_value, record in zip(x_data, self._last_records):
+                value = record.get(stat.key)
+                if isinstance(value, (int, float)):
+                    xs.append(float(x_value))
+                    ys.append(float(value))
+            if len(xs) < 2:
+                continue
+            info = PARAMETERS.get(stat.key)
+            descriptor = info.description if info and info.description else stat.label
+            unit_suffix = f" {stat.unit}" if stat.unit else ""
+            explanation = (
+                f"{descriptor}. Range {fmt(stat.min_value)} - {fmt(stat.max_value)}{unit_suffix}. "
+                f"Latest value {fmt(stat.last_value)}{unit_suffix}."
+            )
+            series_list.append(
+                ParameterSeries(
+                    key=stat.key,
+                    label=stat.label,
+                    unit=stat.unit,
+                    color=color,
+                    x_values=tuple(xs),
+                    y_values=tuple(ys),
+                    explanation=explanation,
+                )
+            )
+        return series_list
+
+    @staticmethod
+    def _status_badge_snapshot(detail: StatusDetail | None) -> Dict[str, str]:
+        snapshot: Dict[str, str] = {}
+        if not detail:
+            return snapshot
+        entries = list(detail.badges)
+        for entry in detail.details:
+            if entry not in entries:
+                entries.append(entry)
+        for entry in entries:
+            if ": " not in entry:
+                continue
+            raw_key, raw_value = entry.split(": ", 1)
+            key = STATUS_FIELD_TRANSLATIONS.get(_normalize_status_label(raw_key), raw_key.strip())
+            clean_value = raw_value.strip()
+            value = STATUS_VALUE_TRANSLATIONS.get(_normalize_status_label(clean_value), clean_value)
+            snapshot[key] = value
+        return snapshot
+
+
+
+    def _collect_status_markers(
+        self,
+        x_data: Sequence[float],
+        records: Sequence[Dict[str, Number | str]],
+    ) -> List[StatusMarker]:
+        markers: List[StatusMarker] = []
+        if not x_data or not records:
+            return markers
+        limit = max(0, len(records) - 1)
+        prev_snapshot: Dict[str, str] | None = None
+        for idx, (x_value, record) in enumerate(zip(x_data, records)):
+            if idx >= limit:
+                break
+            detail = decode_status(record.get("P05"), self.config.status_bits)
+            snapshot = self._status_badge_snapshot(detail)
+            if prev_snapshot is None:
+                prev_snapshot = snapshot
+                continue
+            if snapshot != prev_snapshot:
+                changes: List[str] = []
+                keys = sorted(set(prev_snapshot.keys()) | set(snapshot.keys()))
+                for key in keys:
+                    before = prev_snapshot.get(key)
+                    after = snapshot.get(key)
+                    if before == after:
+                        continue
+                    if before and after:
+                        changes.append(f"{key}: {before} -> {after}")
+                    elif after:
+                        changes.append(f"{key}: {after}")
+                    elif before:
+                        changes.append(f"{key}: {before} -> -")
+                if not changes:
+                    changes.append("Status changed")
+                markers.append(StatusMarker(position=float(x_value), label=" | ".join(changes[:3])))
+            prev_snapshot = snapshot
+        return markers
+
+    def _open_raw_data(self) -> None:
+        if not self.config.persist_csv:
+            self.status.showMessage("Raw data logging is disabled", 3000)
+            return
+        path = None
+        if self._controller:
+            path = self._controller.raw_log_path()
+        if path is None:
+            path = self.config.persist_path
+        if path is None:
+            self.status.showMessage("No raw data file available", 3000)
+            return
+        path = Path(path)
         if not path.exists():
-            self.status.showMessage("Keine CSV-Datei vorhanden", 3000)
+            self.status.showMessage("No raw data file available", 3000)
             return
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
 
@@ -1017,19 +1531,32 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._last_records:
             QtWidgets.QMessageBox.information(
                 self,
-                "Kein Messprotokoll",
-                "Es wurden noch keine Messdaten empfangen.",
+                "No measurement report",
+                "No telemetry data received yet.",
             )
             return
 
-        default_dir = self.config.persist_path.parent
+        meta = self.databus.meta()
+        if self._controller:
+            export_stem = self._controller.export_stem(meta)
+            log_path = self._controller.raw_log_path()
+        else:
+            export_stem = datetime.now().strftime('%Y%m%d_%H%M%S_raw')
+            log_path = None
+
+        if log_path is not None:
+            default_dir = Path(log_path).parent
+        elif self.config.persist_path:
+            default_dir = self.config.persist_path.parent
+        else:
+            default_dir = Path.cwd() / 'logs'
         default_dir.mkdir(parents=True, exist_ok=True)
-        suggested = default_dir / f"messprotokoll_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        suggested = default_dir / export_stem
         selected, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
-            "Messprotokoll speichern",
+            "Save measurement report",
             str(suggested),
-            "PDF-Dateien (*.pdf)",
+            "PDF files (*.pdf)",
         )
         if not selected:
             return
@@ -1039,9 +1566,8 @@ class MainWindow(QtWidgets.QMainWindow):
             target = target.with_suffix(".pdf")
 
         last_record = self._last_records[-1]
-        meta = self.databus.meta()
         status_value = last_record.get("P05")
-        status_detail = decode_status(status_value)
+        status_detail = decode_status(status_value, self.config.status_bits)
         strategy_code = meta.get("P04")
         strategy_label = label_strategy(strategy_code, self.config.strategy_labels)
 
@@ -1080,6 +1606,9 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 hidden_stats.append(stat)
 
+        series_list = self._collect_series_for_pdf(x_data, visible_stats)
+        status_markers = self._collect_status_markers(x_data, self._last_records)
+
         x_info = PARAMETERS.get(self._x_key)
         x_caption = f"{self._x_key} – {x_info.description}" if x_info and x_info.description else self._x_key
         x_unit = x_info.unit if x_info else None
@@ -1094,6 +1623,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 strategy_label,
                 visible_stats,
                 hidden_stats,
+                series_list,
+                status_markers,
                 len(self._last_records),
                 duration,
                 x_caption,
@@ -1106,11 +1637,37 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(
                 self,
                 "Export fehlgeschlagen",
-                f"Das Messprotokoll konnte nicht erstellt werden:\n{exc}",
+                f"The report could not be generated:\n{exc}",
             )
             return
 
-        self.status.showMessage(f"Messprotokoll gespeichert: {target}", 4000)
+        self.status.showMessage(f"Report saved to {target}", 4000)
+
+    def _open_config_dialog(self) -> None:
+        if not self._controller:
+            return
+        dialog = ConfigDialog(self.config, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        new_config = dialog.result_config()
+        if new_config is None:
+            return
+        if self._controller.apply_config(new_config):
+            self.status.showMessage("Configuration updated", 3000)
+
+    def _handle_status_message(self, message: str, timeout: int) -> None:
+        self.status.showMessage(message, timeout)
+
+    def _handle_acquisition_error(self, message: str) -> None:
+        QtWidgets.QMessageBox.warning(self, "Data source", message)
+        self.status.showMessage(message, 5000)
+
+    def _on_config_changed(self, config: AppConfig) -> None:
+        self.config = config
+        self.status_badges.set_config(config)
+        self._refresh_action_state()
+        interval = max(15, int(1000 / max(1.0, self.config.ui_refresh_hz)))
+        self._timer.setInterval(interval)
 
 
 __all__ = ["MainWindow"]

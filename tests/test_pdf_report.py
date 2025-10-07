@@ -1,4 +1,4 @@
-"""Tests für PDF-Export und UI-Helfer."""
+﻿"""Tests für PDF-Export und UI-Helfer."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -6,6 +6,21 @@ from datetime import datetime
 import pytest
 
 pytest.importorskip("PySide6")
+try:
+    from playwright.sync_api import sync_playwright  # type: ignore import
+except ImportError as exc:
+    pytest.skip(f"Playwright unavailable: {exc}", allow_module_level=True)
+else:
+    try:
+        with sync_playwright() as playwright:
+            try:
+                browser = playwright.chromium.launch(headless=True)
+            except Exception as exc:
+                pytest.skip(f"Playwright Chromium unavailable: {exc}", allow_module_level=True)
+            else:
+                browser.close()
+    except Exception as exc:
+        pytest.skip(f"Playwright initialization failed: {exc}", allow_module_level=True)
 
 from wtc3_logger.status import decode_status
 
@@ -14,7 +29,7 @@ try:  # pragma: no cover - Abhängigkeiten fehlen ggf. im CI
 except ImportError as exc:  # pragma: no cover
     pytest.skip(f"UI-Komponenten nicht verfügbar: {exc}", allow_module_level=True)
 
-from wtc3_logger.ui.pdf_report import ParameterStatistic, render_measurement_report
+from wtc3_logger.ui.pdf_report import ParameterSeries, ParameterStatistic, StatusMarker, render_measurement_report
 
 
 def test_render_measurement_report_creates_pdf(tmp_path, qapp):
@@ -40,6 +55,19 @@ def test_render_measurement_report_creates_pdf(tmp_path, qapp):
         )
     ]
 
+    series = [
+        ParameterSeries(
+            key="P40",
+            label="Eingangsspannung",
+            unit="mV",
+            color="#ff0000",
+            x_values=(0.0, 60.0, 125.5),
+            y_values=(1000.0, 1500.0, 1800.0),
+            explanation="Input voltage across the measured duration.",
+        )
+    ]
+    markers = [StatusMarker(position=60.0, label="Batteriespannung: Tief -> Normal")]
+
     render_measurement_report(
         target,
         meta,
@@ -49,6 +77,8 @@ def test_render_measurement_report_creates_pdf(tmp_path, qapp):
         "CC-CV",
         visible_stats,
         [],
+        series,
+        markers,
         sample_count=3,
         duration_seconds=125.5,
         x_axis_caption="P06 – Laufzeit",
